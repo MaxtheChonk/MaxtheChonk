@@ -11,12 +11,12 @@ from dataclasses import dataclass, replace
 from typing import Optional
 
 import numpy as np
-from scipy.signal import butter, lfilter, sosfilt
+from scipy.signal import butter, fftconvolve, lfilter, sosfilt
 from scipy.special import jn_zeros
 
 from drum_modal import DrumParams, ModeTable, mode_table, render, two_head_tables
 
-COLUMN, RIM = -1, -2   # values of ModeTable.m marking non-membrane partials
+COLUMN, RIM, POP = -1, -2, -3   # values of ModeTable.m marking non-membrane partials
 
 
 @dataclass
@@ -55,6 +55,15 @@ class DrumPreset:
     noise_db: tuple = ()               # [band][slice] energy, dB re the modal energy
                                        # inside the first noise_edges[-1] seconds
     noise_seed: int = 0
+    # attack pop: one short, heavily damped partial just below the pitch mode
+    pop_amp: float = 0.0               # amplitude re the strongest membrane partial; 0 = off
+    pop_ratio: float = 0.72            # its frequency as a multiple of the pitch-mode frequency
+    pop_decay: float = 186.0           # 1/s
+    # room: NOT fitted (the reference tails sink into its background before any room decay
+    # can be separated). Plain exponential-noise reverb for auditioning; yours to set.
+    room_db: float = float("-inf")     # reverb energy re the dry hit, dB; -inf = off
+    room_rt60: float = 0.5             # s
+    room_seed: int = 0
 
 
 # ------------------------------------------------------------------ helpers
@@ -109,6 +118,7 @@ def drum_tables(d: DrumPreset):
     """Returns (out_table, reso_table). reso_table is None for single-head drums."""
     if d.reso is None:
         out, reso = mode_table(d.batter), None
+        pitch_hz = out.freq[(out.m == d.pitch_mode[0]) & (out.n == d.pitch_mode[1])][0]
         if d.rung_amp_db:
             k = len(d.rung_amp_db)
             rung = (out.n == 1) & (out.m < k)
@@ -117,7 +127,10 @@ def drum_tables(d: DrumPreset):
                             10 ** (np.asarray(d.rung_amp_db)[m] / 20), np.asarray(d.rung_decay)[m])
     else:
         out, reso = two_head_tables(d.batter, d.reso, d.coupling)
+        pitch_hz = out.freq[0]
     ref = np.max(np.abs(out.amp))
+    if d.pop_amp != 0:
+        out = add_partials(out, POP, d.pop_ratio * pitch_hz, d.pop_amp * ref, d.pop_decay)
     if d.column_L > 0 and d.column_level != 0:
         out = add_partials(out, COLUMN, column_freqs(d.column_L, d.column_n, d.c),
                            d.column_level * ref, d.column_decay)
@@ -190,7 +203,8 @@ def noise_signal(d: DrumPreset, table: ModeTable, n_iter: int = 15) -> np.ndarra
     t = np.arange(n) / p.sr
     edges = np.asarray(d.noise_edges, dtype=float)
     mid, dur = 0.5 * (edges[:-1] + edges[1:]), np.diff(edges)
-    target = modal_energy(table, edges[-1]) * 10 ** (np.asarray(d.noise_db) / 10)
+    body = ModeTable(*(col[table.m != POP] for col in table))   # the map is re the ringing part
+    target = modal_energy(body, edges[-1]) * 10 ** (np.asarray(d.noise_db) / 10)
     rng = np.random.default_rng(d.noise_seed)
     lead = int(0.05 * p.sr)                      # let the filter settle before t = 0
     raw = []
@@ -208,11 +222,23 @@ def noise_signal(d: DrumPreset, table: ModeTable, n_iter: int = 15) -> np.ndarra
     return synth()
 
 
+def add_room(y, sr, rt60, level_db, seed=0):
+    """Dry hit plus a simple room: the hit convolved with exponentially decaying white
+    noise (60 dB down after rt60), scaled so the reverb energy is level_db re the dry
+    energy. Same length as the input, so set duration long enough for the tail."""
+    n = int(rt60 * sr)
+    ir = np.random.default_rng(seed).standard_normal(n) * np.exp(-np.log(1000.0) * np.arange(n) / n)
+    wet = fftconvolve(y, ir)[:len(y)]
+    return y + wet * np.sqrt(np.sum(y ** 2) * 10 ** (level_db / 10) / np.sum(wet ** 2))
+
+
 def render_drum(d: DrumPreset) -> np.ndarray:
     out, reso = drum_tables(d)
     y = render(out, d.batter)
     if d.noise_bands:
         y = y + noise_signal(d, out)
+    if np.isfinite(d.room_db):
+        y = add_room(y, d.batter.sr, d.room_rt60, d.room_db, d.room_seed)
     if d.wires and reso is not None:
         y = y + wire_signal(render(reso, d.batter), np.max(np.abs(y)), d, d.batter.sr)
     return y
@@ -266,6 +292,10 @@ REFERENCE_TENORS = [
 # Low confidence on decay (hits follow each other every 0.3-0.6 s, tails are cut).
 TENOR_RUNG_AMP_DB = (-9.5, 0.0, -10.7, -20.4, -31.3, -26.6, -31.3, -28.5)   # dB, m = 0..7
 TENOR_RUNG_DECAY = (13.3, 15.3, 9.1, 6.7, 6.1, 8.2, 6.3, 5.3)             # 1/s, m = 0..7
+# Attack pop, median over the 8 hits (fit.measure_pop). LOW CONFIDENCE: frequency ratio is
+# consistent (0.66-0.80), amplitude (1.1-4.9) and decay (50-307 1/s) scatter widely, and the
+# two-component fit leaves 32-68% of the first 12 ms unexplained.
+TENOR_POP_AMP, TENOR_POP_RATIO, TENOR_POP_DECAY = 2.0, 0.72, 186.0
 TENOR_NOISE_BANDS = ((1200.0, 2400.0), (2400.0, 4800.0), (4800.0, 9600.0))
 TENOR_NOISE_EDGES = (0.0, 0.003, 0.01, 0.03, 0.08, 0.2, 0.3)
 TENOR_NOISE_DB = (
@@ -283,5 +313,7 @@ def reference_tenors():
         batter = replace(d.batter, f01_scale=scale, duration=1.0)
         out.append(replace(d, batter=batter, rung_amp_db=TENOR_RUNG_AMP_DB,
                            rung_decay=TENOR_RUNG_DECAY, noise_bands=TENOR_NOISE_BANDS,
-                           noise_edges=TENOR_NOISE_EDGES, noise_db=TENOR_NOISE_DB))
+                           noise_edges=TENOR_NOISE_EDGES, noise_db=TENOR_NOISE_DB,
+                           pop_amp=TENOR_POP_AMP, pop_ratio=TENOR_POP_RATIO,
+                           pop_decay=TENOR_POP_DECAY))
     return out

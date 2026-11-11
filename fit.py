@@ -13,7 +13,7 @@ from itertools import product
 
 import numpy as np
 from scipy.optimize import least_squares
-from scipy.signal import butter, find_peaks, sosfilt, stft
+from scipy.signal import butter, find_peaks, sosfilt, sosfiltfilt, stft
 from scipy.special import jn_zeros
 
 from drums import DrumPreset, band_time_energy, drum_tables, f0_for_pitch, render_drum
@@ -342,6 +342,32 @@ def measure_rungs(y, sr, f11, K, f01_scale, n_rungs=8, nperseg=2048, match_cents
     with np.errstate(invalid="ignore", divide="ignore"):
         amp_db = level[np.searchsorted(f, near)] + 20 * np.log10(decay / (1 - np.exp(-decay * T)))
     return np.where(ok & (decay > 0), amp_db, np.nan), decay
+
+
+def measure_pop(y, sr, f11, body_decay=15.0, window_s=0.012, lowpass_hz=2500.0):
+    """Attack pop: least-squares fit of two damped sines to the first window_s of a hit,
+    a short burst (free amplitude, decay, frequency, phase) plus the ringing pitch mode
+    (frequency f11, decay body_decay, free amplitude and phase).
+    Returns (pop_amp / body_amp, pop_decay 1/s, pop_freq / f11, relative_fit_error).
+    Rough by nature: check relative_fit_error before trusting the numbers."""
+    x = sosfiltfilt(butter(4, lowpass_hz / (sr / 2), "low", output="sos"), y)
+    on = max(int(np.argmax(np.abs(x) > 0.2 * np.max(np.abs(x)))) - int(0.0005 * sr), 0)
+    seg = x[on:on + int(window_s * sr)]
+    seg = seg / np.max(np.abs(seg))
+    t = np.arange(len(seg)) / sr
+
+    def resid(p):
+        a1, d1, ratio, ph1, a2, ph2, t0 = p
+        tt = np.maximum(t - t0, 0)
+        model = (a1 * np.exp(-d1 * tt) * np.sin(2 * np.pi * ratio * f11 * tt + ph1)
+                 + a2 * np.exp(-body_decay * tt) * np.sin(2 * np.pi * f11 * tt + ph2)) * (t >= t0)
+        return model - seg
+
+    lo, hi = [0, 30, 0.4, -7, 1e-3, -7, 0.0], [5, 3000, 2.5, 7, 2, 7, 0.002]
+    best = min((least_squares(resid, [1.0, 400.0, r0, ph, 0.4, 0.0, 0.0005], bounds=(lo, hi))
+                for r0 in (0.7, 0.85, 1.0, 1.2) for ph in (0.0, 1.5, 3.0, 4.5)), key=lambda r: r.cost)
+    a1, d1, ratio, _, a2, _, _ = best.x
+    return float(a1 / a2), float(d1), float(ratio), float(np.sqrt(np.mean(best.fun ** 2) / np.mean(seg ** 2)))
 
 
 def align_to_attack(y, sr, lead_s=0.001):

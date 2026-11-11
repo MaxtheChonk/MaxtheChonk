@@ -31,14 +31,20 @@
   `modal_energy`). Measured by `fit.tenor_profile` (uses `measure_rungs`, `measure_noise`).
   Constants: `drums.TENOR_RUNG_AMP_DB`, `TENOR_RUNG_DECAY`, `TENOR_NOISE_*`; used by
   `reference_tenors()`. `ladder` anchor bound tightened to +-0.5% in `fit_ladder`.
+- Attack pop (user request): `DrumPreset.pop_amp / pop_ratio / pop_decay`, one extra damped
+  partial (ModeTable.m == POP == -3) at pop_ratio x the pitch-mode frequency. Measured by
+  `fit.measure_pop`; constants `drums.TENOR_POP_*`, on in `reference_tenors()`. The noise map
+  is referred to the ringing part only, so the pop does not change the noise.
+- Room (user request): `DrumPreset.room_db / room_rt60`, `drums.add_room`. Plain
+  exponential-noise reverb, OFF by default, NOT fitted: values are the user's to set.
 - `demo.py`: all SPEC deliverables render into `out/` (gitignored). Add paths to `REFERENCES`
   in demo.py to fit and print reports.
 
 ## Test results
-Last run `python -m pytest -q` -> 29 passed
+Last run `python -m pytest -q` -> 32 passed
 - L1 (3), L2 (1), L3 (4), L4 (2), L5 (6), L6 (3), screening (2), slicer (1), retune (1),
   tenor pitch mode / (0,1) offset / ladder (3), rung profile (1), noise map (1), profile
-  round trip (1).
+  round trip (1), pop (2), room (1).
 - History of the last two: both failed twice, then were fixed in the code:
   noise map -> `noise_signal` now calibrates its envelope nodes by analysis-by-synthesis
   against `band_time_energy` (the same analysis used on recordings) and synthesises each band
@@ -187,6 +193,22 @@ User verdict on `tenor_sweep.wav`: right notes, not a tenor. Measured against th
 - Starting phase of the partials (sin vs cos) was checked: no effect on the attack envelope.
 - Real attack: rises over 3 ms, dips ~10 dB at 6 ms, body at -5..-10 dB. Model body sits
   about 4 dB higher relative to its attack. Not addressed.
+
+## Pop and room (user: "missing that transient little pop / click and some room")
+- Fine-time look at the 8 hits: above 2 kHz the model's first ms already matched. Broadband,
+  the real hits stay ~+10 dB re the body for the first ~4.5 ms, then dip; raw waveforms show
+  the first 1.5 cycles ~2.5x larger than what follows, on every hit.
+- `measure_pop` (burst + ringing (1,1), least squares on the first 12 ms): frequency ratio
+  0.66-0.80 x f11 (median 0.72, consistent), amplitude ratio 1.1-4.9 (median 2.0), decay
+  50-307 1/s (median 186). Fit leaves 32-68% unexplained: LOW CONFIDENCE.
+- With the pop built in, the model's attack envelope is louder but the wrong shape: model
+  peaks in the first 1 ms and has dropped by 3 ms; real holds for ~4.5 ms. Not resolved.
+  Candidates: noise slice 0 and pop both start at t = 0; real burst may start later or be
+  two components; 84 kbps MP3 smears transients.
+- Room cannot be measured from this file: band levels reach the background (-35..-50 dB)
+  by 0.5-0.7 s with late slopes of 0.3-5 1/s that vary by band and hit.
+- Sent to the user for listening: out/tenor_1_no_pop, 2_with_pop, 3/4 with example rooms
+  (0.3 s at -18 dB, 0.8 s at -12 dB; examples only).
 
 ## Exact next step
 The limit is now the reference recording, not the fitting code. Before more modelling, get a

@@ -366,7 +366,7 @@ def test_fit_ladder_picks_the_11_anchor():
 def test_rung_profile_replaces_formula_amps_but_keeps_physics_freqs():
     import drums
     from dataclasses import replace
-    d = drums.reference_tenors()[0]
+    d = replace(drums.reference_tenors()[0], pop_amp=0.0)
     t = drums.drum_tables(d)[0]
     k = len(drums.TENOR_RUNG_AMP_DB)
     assert np.all(t.n == 1) and sorted(t.m) == list(range(k))            # only the ladder
@@ -383,7 +383,7 @@ def test_noise_off_is_pure_modal_and_on_matches_its_map():
     import drums, fit
     from dataclasses import replace
     from drum_modal import render
-    d = drums.reference_tenors()[1]
+    d = replace(drums.reference_tenors()[1], pop_amp=0.0)
     dry = replace(d, noise_bands=())
     table = drums.drum_tables(dry)[0]
     modal = render(table, dry.batter)
@@ -399,7 +399,7 @@ def test_tenor_profile_round_trip():
     # Render the reference tenors, measure them like a recording, get the profile back.
     import drums, fit
     from dataclasses import replace
-    ref = drums.reference_tenors()
+    ref = [replace(d, pop_amp=0.0) for d in drums.reference_tenors()]   # ladder + noise only
     amp, dec = np.array(drums.TENOR_RUNG_AMP_DB), np.array(drums.TENOR_RUNG_DECAY)
 
     # (a) ladder part alone (noise off): everything comes back tightly
@@ -421,3 +421,53 @@ def test_tenor_profile_round_trip():
     assert np.allclose(np.array(p["rung_amp_db"])[strong], amp[strong], atol=1.5)
     assert np.allclose(np.array(p["rung_decay"])[strong], dec[strong], rtol=0.1)
     assert np.allclose(p["noise_db"], drums.TENOR_NOISE_DB, atol=3.0)
+
+
+# ---------------------------------------------------------------- attack pop + room
+
+def test_pop_is_one_extra_partial_and_leaves_the_rest_alone():
+    import drums
+    from dataclasses import replace
+    d = drums.reference_tenors()[2]
+    off = drums.drum_tables(replace(d, pop_amp=0.0))[0]
+    on = drums.drum_tables(d)[0]
+    pop = on.m == drums.POP
+    assert pop.sum() == 1 and not np.any(off.m == drums.POP)
+    pitch = off.freq[off.m == 1][0]
+    assert np.isclose(on.freq[pop][0], d.pop_ratio * pitch)
+    assert np.isclose(on.amp[pop][0], d.pop_amp * np.max(off.amp)) and on.decay[pop][0] == d.pop_decay
+    assert np.array_equal(on.freq[~pop], off.freq) and np.array_equal(on.amp[~pop], off.amp)
+    # the noise is referred to the ringing part only, so the pop does not change it
+    dry_on, dry_off = replace(d, noise_bands=()), replace(d, noise_bands=(), pop_amp=0.0)
+    noise_on = drums.render_drum(d) - drums.render_drum(dry_on)
+    noise_off = drums.render_drum(replace(d, pop_amp=0.0)) - drums.render_drum(dry_off)
+    assert np.allclose(noise_on, noise_off, atol=1e-9)
+
+
+def test_measure_pop_recovers_a_two_component_hit():
+    import fit
+    sr, f11 = 48000, 480.0
+    t = np.arange(int(0.05 * sr)) / sr
+    y = 2.0 * np.exp(-200.0 * t) * np.sin(2 * np.pi * 0.72 * f11 * t) + np.exp(-15.0 * t) * np.sin(2 * np.pi * f11 * t)
+    amp, decay, ratio, err = fit.measure_pop(y, sr, f11)
+    assert np.isclose(amp, 2.0, rtol=0.1) and np.isclose(decay, 200.0, rtol=0.1)
+    assert np.isclose(ratio, 0.72, rtol=0.02) and err < 0.05
+
+
+def test_room_off_is_dry_and_on_has_the_set_energy_and_decay():
+    import drums
+    from dataclasses import replace
+    d = replace(drums.reference_tenors()[0], noise_bands=())
+    d = replace(d, batter=replace(d.batter, duration=2.0))
+    dry = drums.render_drum(d)
+    assert np.array_equal(drums.render_drum(replace(d, room_db=float("-inf"))), dry)
+    wet = drums.render_drum(replace(d, room_db=-10.0, room_rt60=0.6)) - dry
+    assert np.isclose(10 * np.log10(np.sum(wet ** 2) / np.sum(dry ** 2)), -10.0, atol=0.01)
+    # tail: energy 0.9-1.2 s vs 0.3-0.6 s should have fallen by 60 dB * 0.6 s / rt60 = 60 dB
+    sr = d.batter.sr
+    late = np.sum(wet[int(0.9 * sr):int(1.2 * sr)] ** 2)
+    early = np.sum(wet[int(0.3 * sr):int(0.6 * sr)] ** 2)
+    assert late < early                                   # decays
+    wet_only = drums.add_room(np.r_[1.0, np.zeros(2 * sr - 1)], sr, 0.6, 0.0) - np.r_[1.0, np.zeros(2 * sr - 1)]
+    e = [np.sum(wet_only[int(a * sr):int((a + 0.1) * sr)] ** 2) for a in (0.1, 0.4)]
+    assert np.isclose(10 * np.log10(e[1] / e[0]), -60.0 * 0.3 / 0.6, atol=2.0)   # rt60 slope
