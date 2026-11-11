@@ -126,3 +126,65 @@ def test_l4_coupling_splits_m0_only():
     assert np.allclose(bt.freq[bt.m > 0], t.freq[t.m > 0])   # m>0 untouched
     assert np.allclose(bt.amp[bt.m > 0], t.amp[t.m > 0])
     assert np.any(rt.amp[rt.m == 0] != 0) and np.all(rt.amp[rt.m > 0] == 0)
+
+
+# ---------------------------------------------------------------- Layer 5
+
+def test_l5_snare_wires_off_is_pure_modal():
+    import drums
+    from drum_modal import render, two_head_tables
+    d = drums.snare("center", wires=False)
+    modal = render(two_head_tables(d.batter, d.reso, d.coupling)[0], d.batter)
+    assert np.array_equal(drums.render_drum(d), modal)
+    wet = drums.render_drum(drums.snare("center", wires=True))
+    assert not np.allclose(wet, modal)
+
+
+def test_l5_snare_edge_more_m_gt0_than_center():
+    import drums
+    center = drums.drum_tables(drums.snare("center", wires=False))[0]
+    edge = drums.drum_tables(drums.snare("edge", wires=False))[0]
+    assert drums.m_gt0_fraction(center) == 0.0
+    assert drums.m_gt0_fraction(edge) > drums.m_gt0_fraction(center)
+
+
+def test_l5_snare_rimshot_adds_one_click_partial():
+    import drums
+    t = drums.drum_tables(drums.snare("rimshot", wires=False))[0]
+    assert np.sum(t.m == drums.RIM) == 1
+    assert np.sum(drums.drum_tables(drums.snare("edge", wires=False))[0].m == drums.RIM) == 0
+
+
+def test_l5_tenor_column_modes_at_predicted_freqs():
+    import drums
+    from dataclasses import replace
+    from scipy.signal import find_peaks
+    from drum_modal import spectrum
+    L, c = 0.25, 343.0
+    d = drums.tenor(300.0, L)
+    # low decay so lines are narrow enough for a 1-bin check (as in the Layer 2 test)
+    d = replace(d, batter=replace(d.batter, d0=2.0, d1=0.001, duration=2.0), column_decay=2.0)
+    table = drums.drum_tables(d)[0]
+    predicted = np.arange(1, d.column_n + 1) * c / (2 * L)
+    assert np.allclose(table.freq[table.m == drums.COLUMN], predicted)
+    f, mag = spectrum(drums.render_drum(d), d.batter.sr)
+    peaks = f[find_peaks(mag)[0]]
+    for fc in predicted:
+        assert abs(peaks[np.argmin(np.abs(peaks - fc))] - fc) <= f[1] - f[0], fc
+
+
+def test_l5_tenor_and_bass_tuned_to_pitch():
+    import drums
+    for pitch in (233.0, 277.0, 311.0, 370.0):
+        t = drums.drum_tables(drums.tenor(pitch, 0.25))[0]
+        assert np.isclose(t.freq[(t.m == 0) & (t.n == 1)][0], pitch)
+    for pitch in (55.0, 65.0, 73.0, 82.0, 98.0):
+        d = drums.bass(pitch)
+        assert d.batter.K > 0
+        assert np.isclose(drums.drum_tables(d)[0].freq[0], pitch)   # lowest partial
+
+
+def test_l5_bass_mallet_softer_than_snare_stick():
+    import drums
+    b, s = drums.bass(65.0).batter, drums.snare().batter
+    assert b.contact_s > s.contact_s and b.fc < s.fc
