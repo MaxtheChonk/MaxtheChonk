@@ -10,12 +10,14 @@
   Checked on synthetic hits only: no reference recordings supplied yet.
 - Reference screening (not in SPEC, user-approved): `fit.screen(y, sr) -> Screen`. Runs inside
   `fit_drum`; `report` prints a TRUST line for pitch/K/coupling and for decay/wires.
+- Hit slicer (not in SPEC): `fit.slice_hits(y, sr) -> [(start, end)]` cuts a long take into
+  candidate single hits; screen each slice before fitting. Tested on a synthetic 4-hit take.
 - `demo.py`: all SPEC deliverables render into `out/` (gitignored). Add paths to `REFERENCES`
   in demo.py to fit and print reports.
 
 ## Test results
-Last run `python -m pytest -q` -> 21 passed
-- L1 (3), L2 (1), L3 (4), L4 (2), L5 (6), L6 (3), screening (2)
+Last run `python -m pytest -q` -> 22 passed
+- L1 (3), L2 (1), L3 (4), L4 (2), L5 (6), L6 (3), screening (2), slicer (1)
 - History: test_l6_fit_recovers_snare_modal_and_wires failed once (wire threshold 0.098 vs
   0.15). Fixed in the fitter, tolerance unchanged: `band_map` went from 10 bands x 8 frames to
   6 bands x 40 frames, because the threshold shows up as WHEN the wire noise cuts off.
@@ -96,8 +98,17 @@ Last run `python -m pytest -q` -> 21 passed
 - Dependencies not pinned: numpy scipy matplotlib soundfile pytest.
 
 ## Exact next step
-1. Get from the user: sample WAV paths, tenor pitches (4-5), bass pitches (5), tenor shell
-   lengths. Put paths in `REFERENCES` in demo.py, pitches/lengths in the constants above it.
-2. Run `python demo.py`, read each printed report including its TRUST line.
-3. Write only the trusted fitted numbers into the preset builders in drums.py; leave
-   untrusted ones as labelled placeholders.
+BLOCKED on audio. First reference chosen by the user: YouTube "Roger Carter Fieldstar Tenor
+Tuning Tutorial" (TAMA - Bergerault USA, 1041 s), https://youtu.be/BpVNv8RxO0o
+Cloud environment "MaxtheChonk" allows www.youtube.com, but the audio is served from
+per-request *.googlevideo.com hosts and only exact hosts can be allowed from a session.
+Unblock by either: (a) user adds `*.googlevideo.com` under Allowed domains in the
+environment settings, or (b) user supplies the audio file. Keep audio OUT of the repo.
+Then:
+1. Convert to mono WAV, `fit.slice_hits`, `fit.screen` each slice, group slices by lowest peak
+   (= drum pitch), list the kept slices with timestamps for the user to confirm which drum.
+2. Fit one tenor first (`fit.fit_drum` with a `drums.tenor(pitch, L_eff)` template). Needs
+   shell length L_eff from the user or the drum's spec sheet.
+3. Write only trusted fitted numbers into drums.py.
+Also pending (user has not said yes): tunable presets = store the air spring as an absolute
+value so coupling survives retuning, `retune(preset, pitch)`, named tuning sets.

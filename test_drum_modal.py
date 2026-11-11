@@ -279,3 +279,19 @@ def test_screen_flags_bad_references():
     ir[0] = 1.0
     s = fit.screen(fftconvolve(ys, ir), sr)
     assert s.decay_ratio < 0.6 and s.trust_freq and not s.trust_decay
+
+
+def test_slice_hits_finds_each_hit_in_a_long_take():
+    import drums, fit
+    sr = 48000
+    pitches = [370.0, 311.0, 277.0, 233.0]
+    gap = np.zeros(int(0.2 * sr))
+    take = np.concatenate([np.concatenate([gap, drums.render_drum(drums.tenor(p, 0.25))]) for p in pitches])
+    take += 1e-4 * np.max(np.abs(take)) * np.random.default_rng(0).standard_normal(len(take))
+    cuts = fit.slice_hits(take, sr)
+    assert len(cuts) == len(pitches)
+    for (a, b), pitch in zip(cuts, pitches):
+        s = fit.screen(take[a:b], sr)
+        assert s.n_hits == 1 and s.trust_freq and s.trust_decay, s.notes
+        f, level = fit.extract_peaks(take[a:b], sr)
+        assert np.isclose(f[0], pitch, rtol=2e-3)       # lowest peak = the tuned (0,1) mode

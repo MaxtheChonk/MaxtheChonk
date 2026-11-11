@@ -105,6 +105,46 @@ def decay_ratio(y, sr, freqs, nperseg=4096, span_db=30.0):
     return float(np.median(ratios)) if ratios else float("nan")
 
 
+FRAME_S, LEAD_FRAMES = 0.005, 10   # 5 ms hop; 50 ms of silence prepended to every file
+
+
+def frame_db(y, sr):
+    """Frame levels in dB re the loudest frame (10 ms rms, 5 ms hop). 50 ms of silence
+    is prepended so a file that starts on the attack still shows a jump:
+    frame i starts at sample (i - LEAD_FRAMES) * hop."""
+    hop = int(FRAME_S * sr)
+    pad = np.concatenate([np.zeros(LEAD_FRAMES * hop), y])
+    n = (len(pad) - 2 * hop) // hop
+    c = np.concatenate([[0.0], np.cumsum(pad ** 2)])
+    i = np.arange(n) * hop
+    rms = np.sqrt(np.maximum(c[i + 2 * hop] - c[i], 0) / (2 * hop))
+    return 20 * np.log10(rms / rms.max() + 1e-10)
+
+
+def onset_frames(y, sr):
+    """Frame index of each hit. An onset is a 10 dB level jump within 30 ms, to within
+    30 dB of the loudest frame; jumps closer than 50 ms are one hit.
+    Counted above 1 kHz: an attack is broadband, while the slow beating of two close low
+    partials (coupled heads) also makes the level jump but only down low."""
+    def jumps(d):
+        low = np.array([d[max(0, i - 6):i].min() if i else d[0] for i in range(len(d))])
+        return np.nonzero((d - low > 10) & (d > -30))[0]
+    on = jumps(frame_db(sosfilt(butter(4, 1000.0 / (sr / 2), "high", output="sos"), y), sr))
+    if len(on) == 0:
+        on = jumps(frame_db(y, sr))
+    return on[np.concatenate([[True], np.diff(on) > 10])] if len(on) else on
+
+
+def slice_hits(y, sr, min_s=0.3, max_s=4.0):
+    """Cut a long recording into candidate single hits. Each slice runs from 5 ms before
+    an onset to 20 ms before the next one (at most max_s); slices shorter than min_s are
+    dropped. Returns [(start_sample, end_sample)]. Screen each slice before fitting."""
+    hop = int(FRAME_S * sr)
+    starts = np.maximum((onset_frames(y, sr) - LEAD_FRAMES - 1) * hop, 0)
+    ends = np.minimum(np.concatenate([starts[1:] - 3 * hop, [len(y)]]), starts + int(max_s * sr))
+    return [(int(a), int(b)) for a, b in zip(starts, ends) if b - a >= min_s * sr]
+
+
 def screen(y, sr, nperseg=4096, min_snr_db=40.0, max_tail_db=-40.0, ratio_range=(0.6, 1.6)) -> Screen:
     """Check a reference hit before trusting a fit to it."""
     peak = np.max(np.abs(y))
@@ -114,28 +154,9 @@ def screen(y, sr, nperseg=4096, min_snr_db=40.0, max_tail_db=-40.0, ratio_range=
     runs = np.nonzero(edges == -1)[0] - np.nonzero(edges == 1)[0]
     clipped = bool(np.sum(runs >= 3) >= 2 or np.any(runs >= 8))
 
-    # frame levels (10 ms rms, 5 ms hop), 50 ms of silence in front so a file that
-    # starts on the attack still shows one onset
-    hop = int(0.005 * sr)
-
-    def frame_db(x):
-        pad = np.concatenate([np.zeros(10 * hop), x])
-        n = (len(pad) - 2 * hop) // hop
-        rms = np.array([np.sqrt(np.mean(pad[i * hop:i * hop + 2 * hop] ** 2)) for i in range(n)])
-        return 20 * np.log10(rms / rms.max() + 1e-10)
-
-    def onsets(d):
-        # level jumps 10 dB within 30 ms, to within 30 dB of the peak
-        rise = np.array([d[i] - d[max(0, i - 6):i].min() if i else 0.0 for i in range(len(d))])
-        return np.nonzero((rise > 10) & (d > -30))[0]
-
-    db = frame_db(y)
-    # count hits above 1 kHz: an attack is broadband, while the slow beating of two
-    # close low partials (coupled heads) also makes the level jump but only down low
-    on = onsets(frame_db(sosfilt(butter(4, 1000.0 / (sr / 2), "high", output="sos"), y)))
-    if len(on) == 0:
-        on = onsets(db)
-    n_hits = int(np.sum(np.diff(on) > 10) + 1) if len(on) else 0   # merge within 50 ms
+    db = frame_db(y, sr)
+    on = onset_frames(y, sr)
+    n_hits = len(on)
 
     first = on[0] if len(on) else 0
     tail_db = float(db[-10:].mean())
