@@ -188,3 +188,46 @@ def test_l5_bass_mallet_softer_than_snare_stick():
     import drums
     b, s = drums.bass(65.0).batter, drums.snare().batter
     assert b.contact_s > s.contact_s and b.fc < s.fc
+
+
+# ---------------------------------------------------------------- Layer 6
+# No reference recordings yet, so the fitter is checked on synthetic hits: render a
+# preset with known parameters, fit from a deliberately wrong template, recover them.
+
+def test_l6_fit_recovers_tenor():
+    import drums, fit
+    truth = drums.tenor(300.0, 0.25, K=0.5)
+    r = fit.fit_drum(drums.render_drum(truth), truth.batter.sr, drums.tenor(250.0, 0.25, K=1.5))
+    b = r.preset.batter
+    assert np.isclose(r.pitch, 300.0, rtol=1e-3)
+    assert abs(b.K - 0.5) < 0.05
+    assert np.isclose(b.d0, truth.batter.d0, rtol=0.05) and np.isclose(b.d1, truth.batter.d1, rtol=0.05)
+    assert np.sqrt(np.mean(r.cents ** 2)) < 1.0
+
+
+def test_l6_fit_recovers_bass_with_coupling():
+    import drums, fit
+    truth = drums.bass(98.0, K=3.0, coupling=0.4)
+    r = fit.fit_drum(drums.render_drum(truth), truth.batter.sr, drums.bass(80.0, K=0.5, coupling=0.05))
+    b = r.preset.batter
+    assert np.isclose(b.f0, truth.batter.f0, rtol=5e-3)
+    assert abs(b.K - 3.0) < 0.1 and abs(r.preset.coupling - 0.4) < 0.02
+    assert np.isclose(b.d0, truth.batter.d0, rtol=0.1) and np.isclose(b.d1, truth.batter.d1, rtol=0.1)
+    assert "rms freq error" in fit.report(r)
+
+
+def test_l6_fit_recovers_snare_modal_and_wires():
+    import drums, fit
+    from dataclasses import replace
+    dry = drums.snare("edge", wires=False)
+    r = fit.fit_drum(drums.render_drum(dry), dry.batter.sr, fit.with_tuning(dry, 330.0, 1.0, 0.5))
+    assert np.isclose(r.preset.batter.f0, 380.0, rtol=0.01)
+    assert abs(r.preset.coupling - 0.2) < 0.02
+    assert np.sqrt(np.mean(r.cents ** 2)) < 5.0
+    # wires: different noise seed than the model uses, so only statistics can match
+    wet = replace(dry, wires=True, wire_threshold=0.15, wire_brightness=4000.0,
+                  wire_level=0.8, wire_seed=7)
+    w = fit.fit_wires(drums.render_drum(wet), wet.batter.sr, r).preset
+    assert abs(w.wire_threshold - 0.15) < 0.05
+    assert np.isclose(w.wire_brightness, 4000.0, rtol=0.25)
+    assert np.isclose(w.wire_level, 0.8, rtol=0.3)
