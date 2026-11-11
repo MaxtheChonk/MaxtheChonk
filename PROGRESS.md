@@ -37,14 +37,25 @@
   is referred to the ringing part only, so the pop does not change the noise.
 - Room (user request): `DrumPreset.room_db / room_rt60`, `drums.add_room`. Plain
   exponential-noise reverb, OFF by default, NOT fitted: values are the user's to set.
+- HYBRID TENORS (user chose test file B: "that's it"): sampled attack + modelled ring.
+  Core: `ModeTable.phase` (optional start phase per partial; None = 0, Layers 1-5 unchanged).
+  `fit.extract_attack(y, sr, rung_decay)`: high-pass, align, ladder fit, least-squares
+  amplitude + phase of the 8 rungs on 15-300 ms, subtract -> attack sample (stored re the
+  (1,1) amplitude) + rung phases. `DrumPreset.attack / attack_lead_s / attack_fade /
+  rung_phase`, `drums.with_attack`, `save_attacks` / `load_attacks` (.npz).
+  `render_drum`: ring delayed by the lead, attack added, noise map fades in as the sample
+  fades out (20-40 ms). Pop partial is off when an attack is set.
+  Attack audio is NOT in the repo: `refs/` is git-ignored. `demo.hybrid_tenors()` extracts
+  from `refs/tenor_tutorial.wav` (mono 48 kHz, TENOR_CUTS in demo.py) into
+  `refs/tenor_attacks.npz`; without those files tenors render model-only.
 - `demo.py`: all SPEC deliverables render into `out/` (gitignored). Add paths to `REFERENCES`
   in demo.py to fit and print reports.
 
 ## Test results
-Last run `python -m pytest -q` -> 32 passed
+Last run `python -m pytest -q` -> 35 passed
 - L1 (3), L2 (1), L3 (4), L4 (2), L5 (6), L6 (3), screening (2), slicer (1), retune (1),
   tenor pitch mode / (0,1) offset / ladder (3), rung profile (1), noise map (1), profile
-  round trip (1), pop (2), room (1).
+  round trip (1), pop (2), room (1), start phase (1), hybrid attack (2).
 - History of the last two: both failed twice, then were fixed in the code:
   noise map -> `noise_signal` now calibrates its envelope nodes by analysis-by-synthesis
   against `band_time_energy` (the same analysis used on recordings) and synthesises each band
@@ -222,19 +233,23 @@ recording and "frankenstein" it. Scratch script (not committed, audio stays out 
 - Files sent: A real attack + that hit's own fitted ring; B real attack + generic model ring
   (pooled profile, phases from the fit, noise map faded in as the sample fades out);
   C one drum's attack reused on all five; D the attacks alone.
-- If adopted: needs a per-partial start phase in the core (ModeTable has none; render starts
-  every partial at sine phase 0), a stored transient per drum, and the user's OWN recordings
-  for anything shipped (these attacks are cut from a third-party video).
+- User verdict: B (real attack + generic model ring) "that's it". Built in (see Done).
+  With the real cuts: rungs explain 41 / 67 / 86 / 68 / 92 % of the ring (587 .. 390 Hz
+  drums), attack energy -2.9 .. -9.5 dB re the hit.
+- Limits: attacks are cut from a third-party video (private testing only; shipping needs
+  the user's own recordings); they carry the 84 kbps MP3 quality; retuning moves the ring
+  but not the attack; one hit per drum, so every hit is identical; a new session must
+  re-supply the audio (refs/ lives only in the container).
 
 ## Exact next step
-The limit is now the reference recording, not the fitting code. Before more modelling, get a
-better tenor source (lossless or high-bitrate, single hits ringing out > 1 s, close and dry),
-then re-run `fit.tenor_profile` on it and update the constants in drums.py.
-Possible model work once a good source exists (each needs user approval, not in SPEC):
-- replace part of the 1.2-5 kHz noise by more measured partials (longer ladder, (m,2) modes)
-- per-drum profiles instead of one shared profile
-- extend the noise map below 1.2 kHz for the attack thump, and above 9.6 kHz
-- hit-to-hit variation (noise seed, small amplitude scatter)
-Still unmodelled: sympathetic ringing of neighbouring drums (195-271 Hz cluster), shell air
-column (length unknown). Then bass drums, then snare (needs a snares-off hit). Also open:
-named tuning sets, golden-file export for the C++ port, causal wire model.
+Tenors sound right to the user in hybrid form. Open items, roughly in order:
+1. Room amount: user asked for "some room"; knobs exist (`room_db`, `room_rt60`), values are
+   the user's call (two example settings were sent, no verdict yet).
+2. Ring quality on the high drum (rungs explain only 41%): more measured partials, per-drum
+   profiles. Needs a better source.
+3. Variation between hits (several attacks per drum, round-robin) and velocity.
+4. Bass drums, then snare (snares-off hit needed). Expect to reuse the hybrid approach.
+5. Port prep: golden-file export (mode table incl. phase, attack sample, noise nodes),
+   causal wire model, named tuning sets.
+To resume with audio: put the tenor tutorial audio at refs/tenor_tutorial.wav (mono 48 kHz),
+run `python demo.py`.

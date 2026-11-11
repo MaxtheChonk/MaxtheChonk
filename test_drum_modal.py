@@ -471,3 +471,58 @@ def test_room_off_is_dry_and_on_has_the_set_energy_and_decay():
     wet_only = drums.add_room(np.r_[1.0, np.zeros(2 * sr - 1)], sr, 0.6, 0.0) - np.r_[1.0, np.zeros(2 * sr - 1)]
     e = [np.sum(wet_only[int(a * sr):int((a + 0.1) * sr)] ** 2) for a in (0.1, 0.4)]
     assert np.isclose(10 * np.log10(e[1] / e[0]), -60.0 * 0.3 / 0.6, atol=2.0)   # rt60 slope
+
+
+# ---------------------------------------------------------------- hybrid: start phase + sampled attack
+
+def test_start_phase_default_is_layer2_and_quarter_turn_is_cosine():
+    from drum_modal import ModeTable, render
+    p = DrumParams(duration=0.1)
+    tb = mode_table(p)
+    assert tb.phase is None
+    zero = ModeTable(tb.m, tb.n, tb.freq, tb.amp, tb.decay, np.zeros(len(tb.freq)))
+    assert np.array_equal(render(zero, p), render(tb, p))
+    one = ModeTable(tb.m[:1], tb.n[:1], tb.freq[:1], tb.amp[:1], tb.decay[:1], np.array([np.pi / 2]))
+    t = np.arange(int(p.sr * p.duration)) / p.sr
+    assert np.allclose(render(one, p), tb.amp[0] * np.exp(-tb.decay[0] * t) * np.cos(2 * np.pi * tb.freq[0] * t))
+
+
+def test_extract_attack_and_hybrid_rebuild_a_known_hit():
+    # Synthetic "recording": the model's ring with known phases, starting 2 ms in, plus a
+    # short noise burst as the attack. Slice the attack out, glue it on the model ring,
+    # and the hit must come back.
+    import drums, fit
+    from dataclasses import replace
+    from drum_modal import ModeTable, render
+    sr, lead = 48000, 0.002
+    d = replace(drums.reference_tenors()[1], noise_bands=(), pop_amp=0.0)
+    d = replace(d, batter=replace(d.batter, duration=0.4))
+    tb = drums.drum_tables(d)[0]
+    rng = np.random.default_rng(3)
+    phase = rng.uniform(-np.pi, np.pi, len(tb.freq))
+    ring = render(ModeTable(tb.m, tb.n, tb.freq, tb.amp, tb.decay, phase), d.batter)
+    n = len(ring)
+    t = np.arange(n) / sr
+    burst = 1.5 * rng.standard_normal(n) * np.exp(-t / 0.002) * (t < 0.012)
+    hit = np.concatenate([np.zeros(int(lead * sr)), ring])[:n] + burst
+    hit = np.concatenate([np.zeros(480), hit])                      # some silence in front
+
+    a = fit.extract_attack(hit, sr, drums.TENOR_RUNG_DECAY)
+    assert a["explained"] > 0.99
+
+    # rebuilt hit vs the recording, from the same start sample, in the same units
+    # (the slice is peak-normalised and the attack is stored re the (1,1) amplitude)
+    rebuilt = drums.render_drum(drums.with_attack(d, a)) * a["peak_amp"]
+    m = int(0.15 * sr)
+    target = hit[a["start"]:a["start"] + m] / np.max(np.abs(hit))
+    assert np.sqrt(np.mean((rebuilt[:m] - target) ** 2) / np.mean(target ** 2)) < 0.1
+
+
+def test_attack_file_round_trip(tmp_path):
+    import drums
+    a = dict(attack=np.arange(5.0), lead_s=0.002, fade=(0.02, 0.04), rung_phase=(0.1, -0.2))
+    path = str(tmp_path / "attacks.npz")
+    drums.save_attacks(path, [a, a])
+    back = drums.load_attacks(path)
+    assert len(back) == 2 and np.array_equal(back[1]["attack"], a["attack"])
+    assert float(back[0]["lead_s"]) == 0.002 and tuple(back[0]["rung_phase"]) == (0.1, -0.2)

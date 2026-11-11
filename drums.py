@@ -48,6 +48,16 @@ class DrumPreset:
     # strike/pickup formula and d0 + d1*f. r_s, r_p, d0, d1 and the mallet are then unused.
     rung_amp_db: tuple = ()            # initial amplitude of (m,1), dB re the strongest
     rung_decay: tuple = ()             # 1/s per rung
+    rung_phase: tuple = ()             # rad, start phase per rung; empty = 0
+    # sampled attack (hybrid): the first milliseconds of a real hit with its ringing rungs
+    # subtracted (fit.extract_attack). The model's ring starts attack_lead_s into the
+    # sample, in phase with the recording it was cut from (rung_phase), so there is no seam.
+    # Retuning moves the ring; the attack stays as recorded.
+    attack: Optional[np.ndarray] = None   # samples at batter.sr, in units where the strongest
+                                          # membrane partial has amplitude 1; None = off
+    attack_lead_s: float = 0.0            # where the ring starts inside the sample
+    attack_fade: tuple = (0.020, 0.040)   # s, the sample fades out between these times and
+                                          # the noise map fades in
     # measured noise map: stick attack and dense upper content that the ladder does not
     # carry. Band-limited noise per band, with an energy envelope given per time slice.
     noise_bands: tuple = ()            # ((lo_hz, hi_hz), ...); empty = off
@@ -103,8 +113,9 @@ def add_partials(t: ModeTable, kind: int, freq, amp, decay) -> ModeTable:
     f = np.concatenate([t.freq, freq])
     a = np.concatenate([t.amp, np.broadcast_to(amp, k)])
     d = np.concatenate([t.decay, np.broadcast_to(decay, k)])
+    ph = None if t.phase is None else np.concatenate([t.phase, np.zeros(k)])
     o = np.argsort(f)
-    return ModeTable(m[o], n[o], f[o], a[o], d[o])
+    return ModeTable(m[o], n[o], f[o], a[o], d[o], None if ph is None else ph[o])
 
 
 def m_gt0_fraction(t: ModeTable) -> float:
@@ -124,7 +135,8 @@ def drum_tables(d: DrumPreset):
             rung = (out.n == 1) & (out.m < k)
             m = out.m[rung]
             out = ModeTable(m, out.n[rung], out.freq[rung],
-                            10 ** (np.asarray(d.rung_amp_db)[m] / 20), np.asarray(d.rung_decay)[m])
+                            10 ** (np.asarray(d.rung_amp_db)[m] / 20), np.asarray(d.rung_decay)[m],
+                            np.asarray(d.rung_phase)[m] if len(d.rung_phase) else None)
     else:
         out, reso = two_head_tables(d.batter, d.reso, d.coupling)
         pitch_hz = out.freq[0]
@@ -203,7 +215,8 @@ def noise_signal(d: DrumPreset, table: ModeTable, n_iter: int = 15) -> np.ndarra
     t = np.arange(n) / p.sr
     edges = np.asarray(d.noise_edges, dtype=float)
     mid, dur = 0.5 * (edges[:-1] + edges[1:]), np.diff(edges)
-    body = ModeTable(*(col[table.m != POP] for col in table))   # the map is re the ringing part
+    keep = table.m != POP                                        # the map is re the ringing part
+    body = ModeTable(table.m[keep], table.n[keep], table.freq[keep], table.amp[keep], table.decay[keep])
     target = modal_energy(body, edges[-1]) * 10 ** (np.asarray(d.noise_db) / 10)
     rng = np.random.default_rng(d.noise_seed)
     lead = int(0.05 * p.sr)                      # let the filter settle before t = 0
@@ -234,14 +247,45 @@ def add_room(y, sr, rt60, level_db, seed=0):
 
 def render_drum(d: DrumPreset) -> np.ndarray:
     out, reso = drum_tables(d)
-    y = render(out, d.batter)
-    if d.noise_bands:
+    p = d.batter
+    y = render(out, p)
+    if d.attack is not None:
+        # hybrid: delay the model by the lead, fade the noise in as the sample fades out
+        n, lead = len(y), int(round(d.attack_lead_s * p.sr))
+        t = np.arange(n) / p.sr + d.attack_lead_s
+        f0, f1 = d.attack_fade
+        keep = 0.5 - 0.5 * np.cos(np.pi * np.clip((f1 - t) / (f1 - f0), 0, 1))   # 1 -> 0
+        if d.noise_bands:
+            y = y + noise_signal(d, out) * (1 - keep)
+        y = np.concatenate([np.zeros(lead), y])[:n]
+        a = d.attack[:n] * np.max(np.abs(out.amp[out.m >= 0]))
+        y[:len(a)] += a
+    elif d.noise_bands:
         y = y + noise_signal(d, out)
     if np.isfinite(d.room_db):
-        y = add_room(y, d.batter.sr, d.room_rt60, d.room_db, d.room_seed)
+        y = add_room(y, p.sr, d.room_rt60, d.room_db, d.room_seed)
     if d.wires and reso is not None:
-        y = y + wire_signal(render(reso, d.batter), np.max(np.abs(y)), d, d.batter.sr)
+        y = y + wire_signal(render(reso, p), np.max(np.abs(y)), d, p.sr)
     return y
+
+
+def with_attack(d: DrumPreset, a: dict) -> DrumPreset:
+    """Hybrid preset: d plus a sampled attack from fit.extract_attack (dict with attack,
+    lead_s, fade, rung_phase). The pop partial is switched off: the sample contains it."""
+    return replace(d, attack=np.asarray(a["attack"]), attack_lead_s=float(a["lead_s"]),
+                   attack_fade=tuple(a["fade"]), rung_phase=tuple(a["rung_phase"]), pop_amp=0.0)
+
+
+def save_attacks(path: str, attacks: list) -> None:
+    """Store a list of extract_attack results (one per drum) in an .npz file."""
+    np.savez(path, **{"%s_%d" % (k, i): np.asarray(a[k]) for i, a in enumerate(attacks)
+                      for k in ("attack", "lead_s", "fade", "rung_phase")})
+
+
+def load_attacks(path: str) -> list:
+    z = np.load(path)
+    count = sum(k.startswith("attack_") for k in z.files)
+    return [{k: z["%s_%d" % (k, i)] for k in ("attack", "lead_s", "fade", "rung_phase")} for i in range(count)]
 
 
 # ------------------------------------------------------------------ presets (placeholders)

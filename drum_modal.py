@@ -41,6 +41,7 @@ class ModeTable(NamedTuple):
     freq: np.ndarray   # Hz
     amp: np.ndarray    # signed linear amplitude
     decay: np.ndarray  # 1/s, envelope = exp(-decay * t)
+    phase: np.ndarray = None   # rad, start phase of each sine; None = all 0 (Layers 1-5)
 
 
 # ---------------------------------------------------------------- Layer 3
@@ -146,9 +147,10 @@ def render(table: ModeTable, p: DrumParams) -> np.ndarray:
     t = np.arange(int(p.sr * p.duration)) / p.sr
     tw = t if p.drop == 0 else t + p.drop * p.tau_d * (1 - np.exp(-t / p.tau_d))
     y = np.zeros_like(t)
-    for f, a, d in zip(table.freq, table.amp, table.decay):
+    phase = np.zeros(len(table.freq)) if table.phase is None else table.phase
+    for f, a, d, ph in zip(table.freq, table.amp, table.decay, phase):
         if f * (1 + max(p.drop, 0.0)) < p.sr / 2:
-            y += a * np.exp(-d * t) * np.sin(2 * np.pi * f * tw)
+            y += a * np.exp(-d * t) * np.sin(2 * np.pi * f * tw + ph)
     return y
 
 

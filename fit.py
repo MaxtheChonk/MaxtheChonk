@@ -370,6 +370,57 @@ def measure_pop(y, sr, f11, body_decay=15.0, window_s=0.012, lowpass_hz=2500.0):
     return float(a1 / a2), float(d1), float(ratio), float(np.sqrt(np.mean(best.fun ** 2) / np.mean(seg ** 2)))
 
 
+def extract_attack(y, sr, rung_decay, n_rungs=8, lead_s=0.002, fit_from_s=0.015,
+                   fade=(0.020, 0.040), fit_len_s=0.3, highpass_hz=150.0, **peak_kw):
+    """Slice the attack out of a single tenor hit for the hybrid model.
+    1. high-pass (hum, rumble), align so the hit starts lead_s into the slice, peak = 1
+    2. ladder fit -> the rung frequencies (the measured peak where a rung has one)
+    3. linear least squares for amplitude and phase of every rung on
+       fit_from_s .. fit_len_s, i.e. after the attack is over
+    4. run those rungs back to the start and subtract: the residual, faded out over
+       `fade`, is the attack
+    The attack is returned in units where the fitted (1,1) rung has amplitude 1, so it can
+    be scaled onto any ring. rung_decay: fallback decay per rung where none is measurable.
+    Returns dict(attack, lead_s, fade, rung_phase, start, peak_amp, f11, K, f01_scale,
+    explained, attack_db): start = sample index in y where the slice begins (rung_phase is
+    relative to start + lead_s), peak_amp = fitted (1,1) amplitude in the normalised slice,
+    explained = share of the 15-300 ms energy the rungs account for, attack_db = attack
+    energy re the whole slice."""
+    x = sosfiltfilt(butter(4, highpass_hz / (sr / 2), "high", output="sos"), y)
+    on = max(int(np.argmax(np.abs(x) > 0.2 * np.max(np.abs(x)))) - int(lead_s * sr), 0)
+    x = x[on:on + int(fit_len_s * sr)]
+    x = x / np.max(np.abs(x))
+    t = np.arange(len(x)) / sr
+
+    f, level = extract_peaks(x, sr, **peak_kw)
+    f11, K, _ = fit_ladder(f, level)
+    scale = find_f01(f, level, f11, K)
+    rung = ladder_freqs(f11, K, n_rungs - 1)
+    rung[0] *= scale
+    near = _nearest(f, rung)
+    freq = np.where(np.abs(_cents(near, rung)) < 40.0, near, rung)
+    dec = measure_decays(x, sr, freq, nperseg=2048, span_db=25.0)
+    dec = np.where(np.isfinite(dec) & (dec > 1.0), dec, np.asarray(rung_decay, dtype=float)[:n_rungs])
+
+    def basis(tt):
+        env = np.exp(-dec[:, None] * tt)
+        return np.concatenate([env * np.cos(2 * np.pi * freq[:, None] * tt),
+                               env * np.sin(2 * np.pi * freq[:, None] * tt)]).T
+
+    late = t >= fit_from_s
+    coef, *_ = np.linalg.lstsq(basis(t[late] - lead_s), x[late], rcond=None)
+    ring = basis(np.maximum(t - lead_s, 0)) @ coef * (t >= lead_s)
+    resid = x - ring
+    keep = 0.5 - 0.5 * np.cos(np.pi * np.clip((fade[1] - t) / (fade[1] - fade[0]), 0, 1))
+    attack = (resid * keep)[:int(fade[1] * sr)]
+    amp = np.hypot(coef[:n_rungs], coef[n_rungs:])          # a*sin(w*t + phase)
+    return dict(attack=attack / amp[1], lead_s=lead_s, fade=tuple(fade), start=on, peak_amp=float(amp[1]),
+                rung_phase=tuple(float(v) for v in np.arctan2(coef[:n_rungs], coef[n_rungs:])),
+                f11=float(f11), K=float(K), f01_scale=float(scale),
+                explained=float(1 - np.sum(resid[late] ** 2) / np.sum(x[late] ** 2)),
+                attack_db=float(10 * np.log10(np.sum(attack ** 2) / np.sum(x ** 2))))
+
+
 def align_to_attack(y, sr, lead_s=0.001):
     """Trim so the hit starts lead_s before the first sample above 20% of the peak."""
     on = int(np.argmax(np.abs(y) > 0.2 * np.max(np.abs(y))))

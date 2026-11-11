@@ -28,6 +28,37 @@ REFERENCES = {
 }
 
 
+# Hybrid tenors: sampled attack + modelled ring. The attacks are cut from a recording that
+# is NOT in the repo (refs/ is git-ignored). Put the mono 48 kHz WAV at TENOR_SOURCE; the
+# attacks are then extracted once into TENOR_ATTACKS. Without either file the tenors render
+# model-only. TENOR_CUTS: (start s, length s) of one clean hit per drum of
+# drums.REFERENCE_TENORS, highest drum first. These cuts are for the TAMA Fieldstar tenor
+# tuning tutorial audio; attacks cut from someone else's recording are for private testing.
+TENOR_SOURCE = "refs/tenor_tutorial.wav"
+TENOR_ATTACKS = "refs/tenor_attacks.npz"
+TENOR_CUTS = [(875.84, 0.58), (874.84, 0.69), (720.43, 0.51), (870.62, 0.48), (669.96, 0.30)]
+
+
+def hybrid_tenors():
+    """Reference tenors with their sampled attacks if available, else model-only."""
+    tenors = drums.reference_tenors()
+    if not os.path.exists(TENOR_ATTACKS) and os.path.exists(TENOR_SOURCE):
+        y, sr = fit.load_mono(TENOR_SOURCE)
+        assert sr == tenors[0].batter.sr, "resample the source to %d Hz" % tenors[0].batter.sr
+        attacks = []
+        for (start, length), d in zip(TENOR_CUTS, tenors):
+            a = fit.extract_attack(y[int((start - 0.05) * sr):int((start + length) * sr)], sr,
+                                   drums.TENOR_RUNG_DECAY, fmin=150, fmax=6000, floor_db=-50)
+            print("%s: attack cut at %.2f s, rungs explain %.0f%% of the ring, attack %.1f dB re hit"
+                  % (d.name, start, 100 * a["explained"], a["attack_db"]))
+            attacks.append(a)
+        drums.save_attacks(TENOR_ATTACKS, attacks)
+    if not os.path.exists(TENOR_ATTACKS):
+        print("no %s: tenors rendered model-only" % TENOR_ATTACKS)
+        return tenors
+    return [drums.with_attack(d, a) for d, a in zip(tenors, drums.load_attacks(TENOR_ATTACKS))]
+
+
 def fitted(d: drums.DrumPreset) -> drums.DrumPreset:
     """Fit d to its reference if one is listed, else return d unchanged."""
     if d.name not in REFERENCES:
@@ -76,7 +107,7 @@ def main():
             d = fitted(drums.snare(strike, wires=wires))
             save(d, "snare_%s_%s" % (strike, "wires" if wires else "nowires"))
 
-    tenors = [fitted(d) for d in drums.reference_tenors()]   # pitch, K, (0,1) fitted; rest placeholder
+    tenors = hybrid_tenors()
     sweep = [save(d, "tenor_%d" % (i + 1)) for i, d in enumerate(tenors)]
     write_wav(OUT + "/tenor_sweep.wav", np.concatenate(sweep), tenors[0].batter.sr)
 
