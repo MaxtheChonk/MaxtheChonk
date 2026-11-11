@@ -23,15 +23,33 @@
      (m,1) rungs) then `find_f01`. Other drums use the old grid + least-squares path.
   `drums.REFERENCE_TENORS` / `reference_tenors()` hold the fitted pitch, K, f01_scale of five
   drums. Decay, mallet, radii, column are still placeholders there.
+- Measured tenor profile (user-approved after A/B/C listening, departs from SPEC amps/decay):
+  `DrumPreset.rung_amp_db` / `rung_decay`: when set, the drum is only the (m,1) ladder,
+  frequencies from the physics, amplitude and decay from reference-measured tables.
+  `DrumPreset.noise_bands` / `noise_edges` / `noise_db`: band x time noise map for the stick
+  attack and the dense 1.2-9.6 kHz content (`drums.noise_signal`, scaled causally from
+  `modal_energy`). Measured by `fit.tenor_profile` (uses `measure_rungs`, `measure_noise`).
+  Constants: `drums.TENOR_RUNG_AMP_DB`, `TENOR_RUNG_DECAY`, `TENOR_NOISE_*`; used by
+  `reference_tenors()`. `ladder` anchor bound tightened to +-0.5% in `fit_ladder`.
 - `demo.py`: all SPEC deliverables render into `out/` (gitignored). Add paths to `REFERENCES`
   in demo.py to fit and print reports.
 
 ## Test results
-Last run `python -m pytest -q` -> 26 passed
-- L1 (3), L2 (1), L3 (4), L4 (2), L5 (6), L6 (3), screening (2), slicer (1), retune (1), tenor pitch mode / (0,1) offset / ladder (3)
-- History: test_l6_fit_recovers_snare_modal_and_wires failed once (wire threshold 0.098 vs
-  0.15). Fixed in the fitter, tolerance unchanged: `band_map` went from 10 bands x 8 frames to
-  6 bands x 40 frames, because the threshold shows up as WHEN the wire noise cuts off.
+Last run `python -m pytest -q` -> 27 passed, 2 FAILED (both new this session, failed twice,
+stopped per the "fails twice" rule; tolerances NOT loosened, tests NOT skipped)
+- FAIL test_noise_off_is_pure_modal_and_on_matches_its_map: noise energy in the 4.8-9.6 kHz
+  band is 3-7.5 dB above its map in the late time slices (other cells within 2.5 dB).
+  Most likely cause: crosstalk. The 4th-order band-pass skirts let the 2.4-4.8 kHz noise,
+  ~15 dB louder there, leak into the band above. `measure_noise` on real audio has the same
+  leak, so the stored map already contains it and the synthesis adds it twice.
+  Likely fix: steeper band filters (order 8+), or solve the small band-leakage matrix.
+- FAIL test_tenor_profile_round_trip: fitted (1,1) of the 590 Hz drum is 587.8 Hz (0.37% off,
+  tolerance 0.2%). Most likely cause: the weak upper rungs (-27..-35 dB) are now buried under
+  the 1.2-2.4 kHz noise, get matched to noise peaks, and pull the joint (f11, K) fit.
+  Likely fix: fit the ladder only on rungs that stand clear of the local noise level, or
+  take f11 straight from the anchor peak and fit K alone.
+- Passing: L1 (3), L2 (1), L3 (4), L4 (2), L5 (6), L6 (3), screening (2), slicer (1),
+  retune (1), tenor pitch mode / (0,1) offset / ladder (3), rung profile (1).
 
 ## Code map
 - `DrumParams` dataclass: every knob. Add new knobs here with defaults that mean "off"
@@ -150,15 +168,22 @@ User verdict on `tenor_sweep.wav`: right notes, not a tenor. Measured against th
   FASTER than high rungs, opposite to d0 + d1*f with d1 > 0. Low confidence (tails cut).
 - Energy above 4 kHz: -22 dB of the total, decaying at ~28 1/s. The model has about -50 dB
   there (M=8, N=4 stops near 3 kHz and has no attack component).
-- A/B test files rendered for the user (scratch script, NOT in the repo; outputs in out/):
-  A current model, B measured rung levels + decays only, C = B + band-limited noise for the
-  >4 kHz attack, D the real hits. Waiting for the user's ears on which gap matters.
+- User verdict on A/B/C/D: C (measured rungs + attack) closest, "not close enough".
+- Remaining gap measured (real minus model with the first attack version, median dB):
+  1.2-2.4 kHz +6..10, 2.4-4.8 kHz +15..29 (sustained), above 9.6 kHz model too loud; and the
+  real envelope spikes in the first 3 ms then drops ~10 dB, the model started flat.
+  The band x time noise map was built to cover both. NOT yet re-measured or heard.
+- Rung amplitudes are now corrected for decay (FFT peak of a truncated decaying sine is
+  a*(1-exp(-dT))/(2d)): m = 0..7 -> -9.5, 0, -10.7, -20.4, -31.8, -26.6, -34.7, -26.2 dB.
+  The "C" file the user liked used uncorrected peak levels, so upper rungs are now quieter.
 
 ## Exact next step
-Get the user's verdict on A/B/C/D. If B or C sounds like a tenor, decide (user approval
-needed, departs from SPEC) how amplitudes and decay should be modelled: e.g. per-rung gain
-and decay tables fitted to the reference on top of the Bessel strike/pickup term, and an
-attack component. Do not adopt by ear alone: the tables must come from measurements.
+1. Fix the two failing tests (causes above), one pytest run.
+2. Re-run the real-vs-model band/time comparison (scratch `gap.py` logic: band x time energy
+   of aligned real hits vs `reference_tenors()` renders) and get the user's ears on the new
+   `out/tenor_sweep.wav` against the real hits.
+3. Still unmodelled: sympathetic ringing of neighbouring drums (195-271 Hz cluster), shell
+   air column (length unknown), per-drum profiles (one shared profile for all five now).
 Tenors also need cleaner audio for decay (isolated hits that ring out > 1 s), shell depth for the
 air column, and a hit recorded with a known strike spot to set r_s / r_p.
 Then bass drums (two heads, uses the old fit path: expect the same nearest-partial ambiguity

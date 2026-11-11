@@ -359,3 +359,49 @@ def test_fit_ladder_picks_the_11_anchor():
     f11, K, rms = fit.fit_ladder(f, level)
     assert np.isclose(f11, 440.0, rtol=1e-3) and np.isclose(K, 2.1, rtol=0.02) and rms < 1.0
     assert np.isclose(fit.find_f01(f, level, f11, K), 0.76, atol=0.01)
+
+
+# ---------------------------------------------------------------- measured tenor profile + attack
+
+def test_rung_profile_replaces_formula_amps_but_keeps_physics_freqs():
+    import drums
+    from dataclasses import replace
+    d = drums.reference_tenors()[0]
+    t = drums.drum_tables(d)[0]
+    k = len(drums.TENOR_RUNG_AMP_DB)
+    assert np.all(t.n == 1) and sorted(t.m) == list(range(k))            # only the ladder
+    formula = drums.drum_tables(replace(d, rung_amp_db=(), rung_decay=()))[0]
+    for m in range(k):
+        assert t.freq[t.m == m][0] == formula.freq[(formula.m == m) & (formula.n == 1)][0]
+        assert np.isclose(20 * np.log10(t.amp[t.m == m][0]), drums.TENOR_RUNG_AMP_DB[m])
+        assert t.decay[t.m == m][0] == drums.TENOR_RUNG_DECAY[m]
+    up = drums.drum_tables(drums.retune(d, 650.0))[0]                    # still retunable
+    assert np.isclose(up.freq[up.m == 1][0], 650.0) and np.array_equal(up.amp, t.amp[np.argsort(t.m)][up.m])
+
+
+def test_noise_off_is_pure_modal_and_on_matches_its_map():
+    import drums, fit
+    from dataclasses import replace
+    from drum_modal import render
+    d = drums.reference_tenors()[1]
+    dry = replace(d, noise_bands=())
+    table = drums.drum_tables(dry)[0]
+    modal = render(table, dry.batter)
+    assert np.array_equal(drums.render_drum(dry), modal)
+    # the noise alone carries the energies its map says, per band and time slice
+    noise = drums.render_drum(d) - modal
+    e = fit.band_time_energy(noise, d.batter.sr, d.noise_bands, d.noise_edges)
+    got = 10 * np.log10(e / drums.modal_energy(table, d.noise_edges[-1]))
+    assert np.allclose(got, d.noise_db, atol=3.0), np.round(got - np.array(d.noise_db), 1)
+
+
+def test_tenor_profile_round_trip():
+    # render the reference tenors, measure them like a recording, get the profile back
+    import drums, fit
+    hits = [drums.render_drum(d) for d in drums.reference_tenors()]
+    p = fit.tenor_profile(hits, 48000)
+    for (f11, K, scale), (pitch, K0, scale0) in zip(p["fits"], drums.REFERENCE_TENORS):
+        assert np.isclose(f11, pitch, rtol=2e-3) and np.isclose(K, K0, rtol=0.05) and abs(scale - scale0) < 0.02
+    assert np.allclose(p["rung_amp_db"], drums.TENOR_RUNG_AMP_DB, atol=1.5)
+    assert np.allclose(p["rung_decay"], drums.TENOR_RUNG_DECAY, rtol=0.1)
+    assert np.allclose(p["noise_db"], drums.TENOR_NOISE_DB, atol=3.0)

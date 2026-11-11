@@ -246,7 +246,7 @@ def fit_ladder(all_f, all_db, n_rungs=5, anchor_db=10.0, good_cents=20.0, clip=1
         return np.clip(_cents(pred, _nearest(all_f, pred)), -clip, clip)
 
     def fit_anchor(f11):
-        lo, hi = [f11 * 0.97, 0.0], [f11 * 1.03, 12.0]
+        lo, hi = [f11 * 0.995, 0.0], [f11 * 1.005, 12.0]   # the anchor peak is measured directly
         r = min((least_squares(resid, [f11, k0], bounds=(lo, hi), diff_step=1e-3,
                                loss="soft_l1", f_scale=8.0)
                  for k0 in (0.5, 2.0, 4.0, 7.0)), key=lambda r: r.cost)
@@ -319,6 +319,87 @@ def _finish(y, sr, fitted, pitch, meas_f, nperseg) -> FitResult:
     pred_f = _nearest(audible_freqs(fitted), meas_f)
     return FitResult(fitted, pitch, meas_f, pred_f, _cents(pred_f, meas_f), dec,
                      screen(y, sr, nperseg=nperseg))
+
+
+# ------------------------------------------------------------------ tenor ladder profile
+
+def measure_rungs(y, sr, f11, K, f01_scale, n_rungs=8, nperseg=2048, match_cents=40.0, **peak_kw):
+    """Initial amplitude (dB) and decay (1/s) of the ladder rungs (m,1), m = 0..n_rungs-1.
+    A rung with no peak within match_cents is nan. The FFT peak of a decaying sine cut
+    off after T seconds is a*(1 - exp(-d*T))/(2*d), so the amplitude is the peak level
+    times d/(1 - exp(-d*T)): slow-decaying rungs look louder in a spectrum than they start."""
+    f, level = extract_peaks(y, sr, **peak_kw)
+    rung = ladder_freqs(f11, K, n_rungs - 1)
+    rung[0] *= f01_scale
+    near = _nearest(f, rung)
+    ok = np.abs(_cents(near, rung)) < match_cents
+    decay = np.where(ok, measure_decays(y, sr, near, nperseg=nperseg, span_db=25.0), np.nan)
+    T = len(y) / sr
+    with np.errstate(invalid="ignore", divide="ignore"):
+        amp_db = level[np.searchsorted(f, near)] + 20 * np.log10(decay / (1 - np.exp(-decay * T)))
+    return np.where(ok & (decay > 0), amp_db, np.nan), decay
+
+
+def align_to_attack(y, sr, lead_s=0.001):
+    """Trim so the hit starts lead_s before the first sample above 20% of the peak."""
+    on = int(np.argmax(np.abs(y) > 0.2 * np.max(np.abs(y))))
+    return y[max(on - int(lead_s * sr), 0):]
+
+
+def band_time_energy(y, sr, bands, edges):
+    """Energy [band][slice]: band-pass, then sum of squares inside each time slice."""
+    out = []
+    for lo, hi in bands:
+        x = sosfilt(butter(4, [lo / (sr / 2), min(hi / (sr / 2), 0.99)], "band", output="sos"), y)
+        out.append([np.sum(x[int(a * sr):int(b * sr)] ** 2) / sr for a, b in zip(edges[:-1], edges[1:])])
+    return np.array(out)
+
+
+def measure_noise(y, sr, modal, bands, edges, floor_db=-80.0):
+    """Noise map of a hit: what it has in each band and time slice beyond the modal part.
+    `modal` is the rendered ladder model of the same drum (no noise). Both are referred to
+    their own energy below bands[0][0] inside edges[-1] seconds, so the result is in dB
+    re the modal energy. Returns [band][slice] dB, floored at floor_db."""
+    T = int(edges[-1] * sr)
+    y = align_to_attack(y, sr)[:T]
+    low = butter(4, bands[0][0] / (sr / 2), "low", output="sos")
+    real = band_time_energy(y, sr, bands, edges) / np.sum(sosfilt(low, y) ** 2) * sr
+    model = band_time_energy(modal[:T], sr, bands, edges) / np.sum(sosfilt(low, modal[:T]) ** 2) * sr
+    return np.maximum(10 * np.log10(np.maximum(real - model, 1e-30)), floor_db)
+
+
+def tenor_profile(hits, sr, n_rungs=8, bands=((1200.0, 2400.0), (2400.0, 4800.0), (4800.0, 9600.0)),
+                  edges=(0.0, 0.003, 0.01, 0.03, 0.08, 0.2, 0.3), **peak_kw):
+    """Pool several single tenor hits (any drums of one set) into one profile.
+    Pass 1: each hit is fitted on its own (ladder, (0,1)); rung amplitudes (re that hit's
+    strongest rung) and rung decays are combined by median.
+    Pass 2: each hit is compared with the ladder-only model of its own drum to get the
+    noise map; maps are combined by median (in dB).
+    Returns dict(rung_amp_db, rung_decay, noise_bands, noise_edges, noise_db,
+                 fits=[(f11, K, f01_scale)])."""
+    import drums
+    amps, decays, fits = [], [], []
+    for y in hits:
+        f, level = extract_peaks(y, sr, **peak_kw)
+        f11, K, _ = fit_ladder(f, level)
+        scale = find_f01(f, level, f11, K)
+        a, d = measure_rungs(y, sr, f11, K, scale, n_rungs, **peak_kw)
+        amps.append(a - np.nanmax(a))
+        decays.append(d)
+        fits.append((f11, K, scale))
+    amp = np.nanmedian(amps, axis=0)
+    rung_amp = tuple(float(v) for v in np.round(amp - np.nanmax(amp), 1))
+    rung_decay = tuple(float(v) for v in np.round(np.nanmedian(decays, axis=0), 1))
+
+    maps = []
+    for y, (f11, K, scale) in zip(hits, fits):
+        d = drums.tenor(f11, 0.0, K=K)
+        d = replace(d, batter=replace(d.batter, f01_scale=scale, sr=sr, duration=edges[-1] + 0.05),
+                    rung_amp_db=rung_amp, rung_decay=rung_decay)
+        maps.append(measure_noise(y, sr, render_drum(with_tuning(d, f11, K, 0.0)), bands, edges))
+    noise_db = tuple(tuple(float(v) for v in row) for row in np.round(np.median(maps, axis=0), 1))
+    return dict(rung_amp_db=rung_amp, rung_decay=rung_decay, noise_bands=tuple(bands),
+                noise_edges=tuple(edges), noise_db=noise_db, fits=fits)
 
 
 # ------------------------------------------------------------------ wire fit (snare)

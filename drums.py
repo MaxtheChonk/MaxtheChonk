@@ -11,7 +11,7 @@ from dataclasses import dataclass, replace
 from typing import Optional
 
 import numpy as np
-from scipy.signal import butter, lfilter
+from scipy.signal import butter, lfilter, sosfilt
 from scipy.special import jn_zeros
 
 from drum_modal import DrumParams, ModeTable, mode_table, render, two_head_tables
@@ -42,6 +42,19 @@ class DrumPreset:
     wire_brightness: float = 6000.0    # Hz, low-pass cutoff of the wire noise
     wire_level: float = 0.5            # relative to peak of the modal signal
     wire_seed: int = 0
+    # measured ladder profile (tenors). When rung_amp_db is set, the drum is ONLY the (m,1)
+    # modes m = 0..len-1: frequencies still come from the physics (f0, K, f01_scale), but
+    # amplitude and decay come from these reference-measured tables instead of the
+    # strike/pickup formula and d0 + d1*f. r_s, r_p, d0, d1 and the mallet are then unused.
+    rung_amp_db: tuple = ()            # initial amplitude of (m,1), dB re the strongest
+    rung_decay: tuple = ()             # 1/s per rung
+    # measured noise map: stick attack and dense upper content that the ladder does not
+    # carry. Band-limited noise per band, with an energy envelope given per time slice.
+    noise_bands: tuple = ()            # ((lo_hz, hi_hz), ...); empty = off
+    noise_edges: tuple = ()            # time-slice edges in s, e.g. (0, 0.003, 0.01, ...)
+    noise_db: tuple = ()               # [band][slice] energy, dB re the modal energy
+                                       # inside the first noise_edges[-1] seconds
+    noise_seed: int = 0
 
 
 # ------------------------------------------------------------------ helpers
@@ -96,6 +109,12 @@ def drum_tables(d: DrumPreset):
     """Returns (out_table, reso_table). reso_table is None for single-head drums."""
     if d.reso is None:
         out, reso = mode_table(d.batter), None
+        if d.rung_amp_db:
+            k = len(d.rung_amp_db)
+            rung = (out.n == 1) & (out.m < k)
+            m = out.m[rung]
+            out = ModeTable(m, out.n[rung], out.freq[rung],
+                            10 ** (np.asarray(d.rung_amp_db)[m] / 20), np.asarray(d.rung_decay)[m])
     else:
         out, reso = two_head_tables(d.batter, d.reso, d.coupling)
     ref = np.max(np.abs(out.amp))
@@ -121,9 +140,55 @@ def wire_signal(reso_disp: np.ndarray, modal_peak: float, d: DrumPreset, sr: int
     return d.wire_level * modal_peak * noise * gate
 
 
+def modal_energy(t: ModeTable, T: float = np.inf) -> float:
+    """Energy (integral of y^2 dt over the first T seconds) of a sum of decaying sines,
+    cross terms ignored: a^2 * (1 - exp(-2*d*T)) / (4*d) per partial. Known before the
+    hit is rendered, so anything scaled by it stays causal."""
+    return float(np.sum(t.amp ** 2 * (1 - np.exp(-2 * t.decay * T)) / (4 * t.decay)))
+
+
+def _envelope(t, mid, log_a):
+    """Log-amplitude through the nodes (mid, log_a): held before the first node, linear
+    between nodes, last slope continued after the last node but never rising."""
+    slope = min((log_a[-1] - log_a[-2]) / (mid[-1] - mid[-2]), 0.0)
+    return np.where(t <= mid[-1], np.interp(t, mid, log_a), log_a[-1] + slope * (t - mid[-1]))
+
+
+def noise_signal(d: DrumPreset, table: ModeTable) -> np.ndarray:
+    """Noise part of the hit from the measured noise map. Per band: white noise through a
+    band-pass, times an envelope whose log-amplitude is interpolated between the slice
+    centres (held before the first, last slope continued after the last, never rising)."""
+    p = d.batter
+    n = int(p.sr * p.duration)
+    t = np.arange(n) / p.sr
+    edges = np.asarray(d.noise_edges, dtype=float)
+    mid, dur = 0.5 * (edges[:-1] + edges[1:]), np.diff(edges)
+    ref = modal_energy(table, edges[-1])
+    rng = np.random.default_rng(d.noise_seed)
+    y = np.zeros(n)
+    for (lo, hi), row in zip(d.noise_bands, d.noise_db):
+        x = sosfilt(butter(4, [lo / (p.sr / 2), min(hi / (p.sr / 2), 0.99)], "band", output="sos"),
+                    rng.standard_normal(n))
+        x /= np.sqrt(np.mean(x ** 2))
+        # unit-rms noise at amplitude A for dur seconds has energy A^2 * dur. Start from
+        # that, then correct the nodes until each slice of the interpolated envelope holds
+        # its target energy (a steep fall inside a long slice otherwise overshoots).
+        target = ref * 10 ** (np.asarray(row) / 10)
+        log_a = 0.5 * np.log(target / dur)
+        for _ in range(20):
+            env = _envelope(t, mid, log_a)
+            got = np.array([np.sum(np.exp(2 * env[int(a * p.sr):int(b * p.sr)])) / p.sr
+                            for a, b in zip(edges[:-1], edges[1:])])
+            log_a += 0.5 * np.log(target / got)
+        y += x * np.exp(_envelope(t, mid, log_a))
+    return y
+
+
 def render_drum(d: DrumPreset) -> np.ndarray:
     out, reso = drum_tables(d)
     y = render(out, d.batter)
+    if d.noise_bands:
+        y = y + noise_signal(d, out)
     if d.wires and reso is not None:
         y = y + wire_signal(render(reso, d.batter), np.max(np.abs(y)), d, d.batter.sr)
     return y
@@ -162,11 +227,9 @@ def bass(pitch_hz: float, K: float = 2.0, coupling: float = 0.2) -> DrumPreset:
 
 
 # Fitted to the first real reference (TAMA Fieldstar tenor tuning tutorial, low-bitrate MP3,
-# see PROGRESS.md): (1,1) pitch in Hz, air loading K, (0,1) scale. Mean over the clean hits
-# found per drum (count in the comment). ONLY these three numbers are fitted; decay, mallet,
-# strike/pickup radii and the air column are still placeholders (tails were cut off and the
-# shell length is unknown), so the column is off. A sixth, higher drum (~757 Hz) was heard
-# in one ambiguous hit and is left out.
+# see PROGRESS.md). Per drum: (1,1) pitch in Hz, air loading K, (0,1) scale; mean over the
+# clean hits found (count in the comment). A sixth, higher drum (~757 Hz) was heard in one
+# ambiguous hit and is left out. The air column is off (shell length unknown).
 REFERENCE_TENORS = [
     (590.0, 3.2, 0.76),   # 3 hits, K 2.9-3.5
     (522.0, 2.1, 0.72),   # 2 hits, K 2.1-2.2
@@ -174,6 +237,18 @@ REFERENCE_TENORS = [
     (440.0, 2.1, 0.77),   # 2 hits, K 2.1
     (390.0, 1.8, 0.81),   # 1 hit
 ]
+# Ladder profile and noise map, median over the same 8 hits (fit.tenor_profile).
+# One shared profile for all five drums: too few hits per drum to fit each separately.
+# Low confidence on decay (hits follow each other every 0.3-0.6 s, tails are cut).
+TENOR_RUNG_AMP_DB = (-9.5, 0.0, -10.7, -20.4, -31.8, -26.6, -34.7, -26.2)   # dB, m = 0..7
+TENOR_RUNG_DECAY = (13.3, 15.3, 9.1, 6.7, 5.5, 8.2, 6.3, 5.3)             # 1/s, m = 0..7
+TENOR_NOISE_BANDS = ((1200.0, 2400.0), (2400.0, 4800.0), (4800.0, 9600.0))
+TENOR_NOISE_EDGES = (0.0, 0.003, 0.01, 0.03, 0.08, 0.2, 0.3)
+TENOR_NOISE_DB = (
+    (-24.0, -21.3, -17.9, -19.6, -21.1, -31.4),   # 1.2-2.4 kHz
+    (-26.0, -25.3, -21.1, -23.0, -28.5, -42.1),   # 2.4-4.8 kHz
+    (-32.9, -32.5, -29.0, -34.3, -45.4, -56.5),   # 4.8-9.6 kHz
+)
 
 
 def reference_tenors():
@@ -181,6 +256,8 @@ def reference_tenors():
     out = []
     for pitch, K, scale in REFERENCE_TENORS:
         d = tenor(pitch, 0.0, K=K)
-        batter = replace(d.batter, f01_scale=scale)
-        out.append(replace(d, batter=batter))
+        batter = replace(d.batter, f01_scale=scale, duration=1.0)
+        out.append(replace(d, batter=batter, rung_amp_db=TENOR_RUNG_AMP_DB,
+                           rung_decay=TENOR_RUNG_DECAY, noise_bands=TENOR_NOISE_BANDS,
+                           noise_edges=TENOR_NOISE_EDGES, noise_db=TENOR_NOISE_DB))
     return out
