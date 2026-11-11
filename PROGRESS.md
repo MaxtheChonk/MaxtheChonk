@@ -15,12 +15,20 @@
 - Retuning (not in SPEC): `drums.retune(preset, pitch_hz)` moves the pitch and holds K, the
   reso/batter ratio, the air column and the absolute air spring (rescales `coupling` by 1/s^2).
   Decay is not adjusted. Named tuning sets NOT built: need real pitches per style from the user.
+- Tenor model changes after the first real reference (user-approved, not in SPEC):
+  1. Tenors tune by the (1,1) mode: `DrumPreset.pitch_mode`, `f0_for_pitch(pitch, K, mode)`.
+     Bass and snare still use (0,1).
+  2. `DrumParams.f01_scale`: multiplies the (0,1) frequency only (1 = on the K curve).
+  3. `fit_drum` on a `pitch_mode == (1,1)` template uses `fit_ladder` (anchor + K from the
+     (m,1) rungs) then `find_f01`. Other drums use the old grid + least-squares path.
+  `drums.REFERENCE_TENORS` / `reference_tenors()` hold the fitted pitch, K, f01_scale of five
+  drums. Decay, mallet, radii, column are still placeholders there.
 - `demo.py`: all SPEC deliverables render into `out/` (gitignored). Add paths to `REFERENCES`
   in demo.py to fit and print reports.
 
 ## Test results
-Last run `python -m pytest -q` -> 23 passed (re-run after adding fmin/floor_db to fit_drum)
-- L1 (3), L2 (1), L3 (4), L4 (2), L5 (6), L6 (3), screening (2), slicer (1), retune (1)
+Last run `python -m pytest -q` -> 26 passed
+- L1 (3), L2 (1), L3 (4), L4 (2), L5 (6), L6 (3), screening (2), slicer (1), retune (1), tenor pitch mode / (0,1) offset / ladder (3)
 - History: test_l6_fit_recovers_snare_modal_and_wires failed once (wire threshold 0.098 vs
   0.15). Fixed in the fitter, tolerance unchanged: `band_map` went from 10 bands x 8 frames to
   6 bands x 40 frames, because the threshold shows up as WHEN the wire noise cuts off.
@@ -113,21 +121,26 @@ Drum-only passages: ~669-671 s, 716-724 s, 750-768 s, 870-881 s, 1000-1022 s.
   This matches the air-loaded (m,1) series, m = 1..5, anchored at (1,1):
   fitting (f11, K) to those 5 peaks gives 3-13 cents rms on 10 hits, with K = 1.7 .. 3.3
   (2 parameters, 5 peaks, K scatters between hits of the same drum).
-- So on real tenors the STRONGEST / pitch-defining mode is (1,1), not (0,1). The presets and
-  `f0_for_pitch` currently tune by (0,1): this is wrong for tenors and must change.
-- The (0,1) mode is not explained: the model puts it at 224-432 Hz, the recordings show low
-  peaks around 183-271 Hz (or nothing clear). Likely extra lowering by the air in the shell,
-  which f = f_ideal/sqrt(1+K/alpha) cannot produce (it caps (1,1)/(0,1) at 2.01).
-  Peaks near 195/213/245/271 Hz also appear in hits on OTHER drums (sympathetic ringing).
-- Generic `fit_drum` on these hits: 15-60 cents rms and inconsistent K (0.7 vs 2.1 for the same
-  drum), because nearest-partial matching in a dense mode set is ambiguous. Not usable as is.
-- `fit_drum` gained `fmin` and `floor_db` arguments for real takes.
+- With the ladder fitter (`fit_ladder`) the same hits give, per drum:
+  590 Hz: K 2.9-3.5 (3 hits), (0,1) at 0.74-0.80 of its K-curve frequency
+  522 Hz: K 2.1-2.2 (2 hits), 0.72      487 Hz: K 1.7 (1 hit), 0.76
+  440 Hz: K 2.1 (2 hits), 0.77          390 Hz: K 1.8 (1 hit), 0.81
+  Ladder rms 2-17 cents. Two hits stay unexplained: 876.44 s (peaks 520/756, maybe a sixth
+  drum at ~757 Hz) and 1019.48 s (strongest 271 Hz, no ladder).
+- CAVEAT: the same peak ratios (1 : 1.43 : 1.82 : 2.21 : 2.57) also equal the K=0 series
+  (1,1),(0,2),(1,2),(2,2),(3,2). The air-loaded (m,1) reading was chosen because an edge
+  strike should excite (2,1),(3,1) strongly and no peaks sit where K=0 would put them, but
+  frequencies alone cannot rule the other reading out. Same ambiguity makes `fit_ladder`
+  unreliable on drums whose true K is near 0 (synthetic K=0.5 was fitted as K=4.4).
+- Synthetic recovery with the ladder fitter: pitch within 0.3%, f01_scale within 0.01,
+  K biased about 8% low (rung 5 merges with a neighbouring mode in the placeholder presets).
+- (0,1) identification is low confidence: neighbouring drums ring in the same range.
+- Generic (non-ladder) `fit_drum` on these hits was unusable: 15-60 cents, inconsistent K.
 
 ## Exact next step
-Decisions needed from the user before changing the model (not in SPEC):
-1. Tune tenors by the (1,1) mode instead of (0,1).
-2. Give (0,1) its own frequency offset knob (fitted), instead of forcing it onto the K curve.
-3. Make `fit_drum` for tenors fit the (m,1) ladder first (anchor at the strongest peak), then
-   assign the remaining peaks.
-After that: write fitted K and the six pitches into a tenor preset, flagged "decay untrusted".
-Still open: named tuning sets, bass and snare references, cleaner tenor audio for decay.
+Tenors: need cleaner audio for decay (isolated hits that ring out > 1 s), shell depth for the
+air column, and a hit recorded with a known strike spot to set r_s / r_p.
+Then bass drums (two heads, uses the old fit path: expect the same nearest-partial ambiguity
+on real audio, consider a ladder-style fit there too), then snare (needs a snares-off hit).
+Still open: named tuning sets per corps style; golden-file export for the C++ port; the
+wire model must be made causal for real time.

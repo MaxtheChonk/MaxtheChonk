@@ -2,8 +2,8 @@
 
     python demo.py
 
-Pitches, shell lengths and all preset numbers are PLACEHOLDERS until reference
-recordings are supplied. To fit: put paths in REFERENCES below; each drum is then
+Tenor pitch, K and (0,1) offset come from the first reference (drums.REFERENCE_TENORS).
+Everything else, including bass pitches, is a PLACEHOLDER until references are supplied. To fit: put paths in REFERENCES below; each drum is then
 fitted (fit.py), its report printed, and the fitted preset used for rendering.
 """
 import os
@@ -16,8 +16,6 @@ import fit
 from drum_modal import plot_spectrum, spectrum, write_wav
 
 OUT = "out"
-TENOR_PITCHES_HZ = [370.0, 311.0, 277.0, 233.0]   # placeholder, drum 1..4
-TENOR_L_EFF_M = [0.20, 0.23, 0.25, 0.28]          # placeholder effective shell lengths
 BASS_PITCHES_HZ = [98.0, 82.0, 73.0, 65.0, 55.0]  # placeholder, drum 1..5
 
 # preset name -> path of a dry, close-mic'd single hit. Snare modal parameters should be
@@ -78,7 +76,7 @@ def main():
             d = fitted(drums.snare(strike, wires=wires))
             save(d, "snare_%s_%s" % (strike, "wires" if wires else "nowires"))
 
-    tenors = [fitted(drums.tenor(p, L)) for p, L in zip(TENOR_PITCHES_HZ, TENOR_L_EFF_M)]
+    tenors = [fitted(d) for d in drums.reference_tenors()]   # pitch, K, (0,1) fitted; rest placeholder
     sweep = [save(d, "tenor_%d" % (i + 1)) for i, d in enumerate(tenors)]
     write_wav(OUT + "/tenor_sweep.wav", np.concatenate(sweep), tenors[0].batter.sr)
 

@@ -14,6 +14,7 @@ from itertools import product
 import numpy as np
 from scipy.optimize import least_squares
 from scipy.signal import butter, find_peaks, sosfilt, stft
+from scipy.special import jn_zeros
 
 from drums import DrumPreset, drum_tables, f0_for_pitch, render_drum
 
@@ -190,7 +191,7 @@ def screen(y, sr, nperseg=4096, min_snr_db=40.0, max_tail_db=-40.0, ratio_range=
 def with_tuning(d: DrumPreset, pitch: float, K: float, coupling: float) -> DrumPreset:
     """Template with new sounding pitch, air loading and coupling.
     The resonant head keeps the template's reso/batter f0 ratio and gets the same K."""
-    f0 = f0_for_pitch(pitch, K)
+    f0 = f0_for_pitch(pitch, K, d.pitch_mode, d.batter.f01_scale)
     reso = None if d.reso is None else replace(d.reso, f0=f0 * d.reso.f0 / d.batter.f0, K=K)
     return replace(d, batter=replace(d.batter, f0=f0, K=K), reso=reso, coupling=coupling)
 
@@ -221,6 +222,55 @@ def freq_residuals(theta, d, meas_f, all_f, n_low=4, clip=200.0):
     return np.clip(np.concatenate([r1, r2]), -clip, clip)
 
 
+def ladder_freqs(f11, K, n_rungs=5):
+    """Air-loaded (m,1) frequencies for m = 0..n_rungs, anchored so (1,1) = f11."""
+    a = np.array([jn_zeros(m, 1)[0] for m in range(n_rungs + 1)])
+    g = a / np.sqrt(1 + K / a)
+    return f11 * g / g[1]
+
+
+def fit_ladder(all_f, all_db, n_rungs=5, anchor_db=10.0, good_cents=20.0, clip=100.0):
+    """Fit (f11, K) to the (m,1) ladder, m = 1..n_rungs: the evenly stepping row of peaks
+    an edge-struck single head shows. Returns (f11, K, rms_cents).
+
+    Anchor: the strongest peak is taken as (1,1), unless a lower strong peak (within
+    anchor_db of it) has a ladder that fits within good_cents rms AND has the strongest
+    peak as one of its rungs; then the lowest such peak is (1,1) and the strongest peak
+    is a higher rung. A ladder started on an unrelated peak can fit by chance, but it
+    will not pass through the strongest peak.
+    Robust loss: one rung matched to a neighbouring mode must not drag K.
+    Known ambiguity: for K near 0 the (m,2) modes also form a ladder that looks like a
+    high-K (m,1) ladder; the fit cannot tell them apart from frequencies alone."""
+    def resid(th):
+        pred = ladder_freqs(*th, n_rungs)[1:]
+        return np.clip(_cents(pred, _nearest(all_f, pred)), -clip, clip)
+
+    def fit_anchor(f11):
+        lo, hi = [f11 * 0.97, 0.0], [f11 * 1.03, 12.0]
+        r = min((least_squares(resid, [f11, k0], bounds=(lo, hi), diff_step=1e-3,
+                               loss="soft_l1", f_scale=8.0)
+                 for k0 in (0.5, 2.0, 4.0, 7.0)), key=lambda r: r.cost)
+        return r.x[0], r.x[1], float(np.sqrt(np.mean(resid(r.x) ** 2)))
+
+    top = all_f[np.argmax(all_db)]
+    for f11 in all_f[(all_db >= all_db.max() - anchor_db) & (all_f < top)]:
+        fit = fit_anchor(f11)
+        rungs = ladder_freqs(fit[0], fit[1], n_rungs)[2:]
+        if fit[2] < good_cents and np.min(np.abs(_cents(rungs, top))) < 30.0:
+            return fit
+    return fit_anchor(top)
+
+
+def find_f01(all_f, all_db, f11, K, window=(0.3, 0.65)):
+    """(0,1) frequency as a multiple of where the K curve puts it: the strongest peak
+    between window[0]*f11 and window[1]*f11. Returns 1.0 if there is no peak there.
+    Low confidence on a multi-drum set: neighbouring drums ring in the same range."""
+    sel = (all_f > window[0] * f11) & (all_f < window[1] * f11)
+    if not sel.any():
+        return 1.0
+    return float(all_f[sel][np.argmax(all_db[sel])] / ladder_freqs(f11, K)[0])
+
+
 def fit_drum(y, sr, template: DrumPreset, n_peaks=10, fmin=30.0, fmax=None, nperseg=4096,
              floor_db=-60.0) -> FitResult:
     """Fit pitch (-> f0), K, coupling to peak frequencies, then d0, d1 to peak decays.
@@ -229,6 +279,14 @@ def fit_drum(y, sr, template: DrumPreset, n_peaks=10, fmin=30.0, fmax=None, nper
     strongest = np.sort(np.argsort(-all_db)[:n_peaks])
     meas_f = all_f[strongest]
     two = template.reso is not None
+
+    if template.pitch_mode == (1, 1):
+        # edge-struck single head: lock onto the (m,1) ladder, then place (0,1) separately
+        pitch, K, _ = fit_ladder(all_f, all_db)
+        scale = find_f01(all_f, all_db, pitch, K)
+        fitted = with_tuning(replace(template, batter=replace(template.batter, f01_scale=scale)),
+                             pitch, K, 0.0)
+        return _finish(y, sr, fitted, pitch, meas_f, nperseg)
 
     # coarse grid (the cost is not smooth: nearest-partial matching), then refine
     # pitch candidates: the lowest peaks, plus the strongest-set's lowest peak read as
@@ -246,13 +304,18 @@ def fit_drum(y, sr, template: DrumPreset, n_peaks=10, fmin=30.0, fmax=None, nper
     pitch, K, coupling = best.x
     fitted = with_tuning(template, pitch, K, coupling if two else 0.0)
 
-    # decay: linear least squares d = d0 + d1*f over the measurable peaks
+    return _finish(y, sr, fitted, pitch, meas_f, nperseg)
+
+
+def _finish(y, sr, fitted, pitch, meas_f, nperseg) -> FitResult:
+    """Decay fit (linear least squares d = d0 + d1*f over the measurable peaks),
+    predicted-vs-measured table and reference screening."""
+    two = fitted.reso is not None
     dec = measure_decays(y, sr, meas_f, nperseg=nperseg)
     ok = np.isfinite(dec)
     d1, d0 = np.polyfit(meas_f[ok], dec[ok], 1) if ok.sum() >= 2 else (0.0, np.nanmean(dec))
     fitted = replace(fitted, batter=replace(fitted.batter, d0=d0, d1=d1),
                      reso=None if not two else replace(fitted.reso, d0=d0, d1=d1))
-
     pred_f = _nearest(audible_freqs(fitted), meas_f)
     return FitResult(fitted, pitch, meas_f, pred_f, _cents(pred_f, meas_f), dec,
                      screen(y, sr, nperseg=nperseg))
@@ -300,8 +363,11 @@ def fit_wires(y, sr, res: FitResult) -> FitResult:
 
 def report(res: FitResult) -> str:
     d = res.preset
-    lines = ["%s: pitch=%.2f Hz  f0=%.2f Hz  K=%.3f  coupling=%.3f  d0=%.2f  d1=%.5f"
-             % (d.name, res.pitch, d.batter.f0, d.batter.K, d.coupling, d.batter.d0, d.batter.d1)]
+    lines = ["%s: pitch=%.2f Hz on mode %s  f0=%.2f Hz  K=%.3f  coupling=%.3f  d0=%.2f  d1=%.5f"
+             % (d.name, res.pitch, d.pitch_mode, d.batter.f0, d.batter.K, d.coupling,
+                d.batter.d0, d.batter.d1)]
+    if d.batter.f01_scale != 1.0:
+        lines.append("(0,1) mode at %.2f x its K-curve frequency (low confidence)" % d.batter.f01_scale)
     if d.wires:
         lines.append("wires: threshold=%.3f  brightness=%.0f Hz  level=%.3f  band rms err=%.2f dB"
                      % (d.wire_threshold, d.wire_brightness, d.wire_level, res.wire_err_db))

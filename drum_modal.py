@@ -30,6 +30,8 @@ class DrumParams:
     fc: float = float("inf")   # Hz, stick rolloff exp(-(f/fc)^2) on amps
     drop: float = 0.0          # pitch drop depth; f(t) = f*(1 + drop*exp(-t/tau_d))
     tau_d: float = 0.05        # s, pitch drop time constant
+    # Fitted from real tenors: the (0,1) mode sits below what the K curve allows
+    f01_scale: float = 1.0     # multiplies the (0,1) frequency only (1 = on the K curve)
 
 
 class ModeTable(NamedTuple):
@@ -71,7 +73,10 @@ def mode_table(p: DrumParams) -> ModeTable:
         norm = (np.pi if m == 0 else np.pi / 2) * jv(m + 1, alpha) ** 2
         ms.append(np.full(p.N, m))
         ns.append(np.arange(1, p.N + 1))
-        freqs.append(f0 * alpha / alpha_01 / np.sqrt(1 + p.K / alpha))
+        f = f0 * alpha / alpha_01 / np.sqrt(1 + p.K / alpha)
+        if m == 0:
+            f[0] *= p.f01_scale
+        freqs.append(f)
         amps.append(jv(m, alpha * p.r_s) * jv(m, alpha * p.r_p) / norm)
     m, n, freq, amp = (np.concatenate(x) for x in (ms, ns, freqs, amps))
     order = np.argsort(freq)

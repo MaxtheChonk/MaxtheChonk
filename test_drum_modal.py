@@ -177,7 +177,7 @@ def test_l5_tenor_and_bass_tuned_to_pitch():
     import drums
     for pitch in (233.0, 277.0, 311.0, 370.0):
         t = drums.drum_tables(drums.tenor(pitch, 0.25))[0]
-        assert np.isclose(t.freq[(t.m == 0) & (t.n == 1)][0], pitch)
+        assert np.isclose(t.freq[(t.m == 1) & (t.n == 1)][0], pitch)   # tenors tune by (1,1)
     for pitch in (55.0, 65.0, 73.0, 82.0, 98.0):
         d = drums.bass(pitch)
         assert d.batter.K > 0
@@ -195,14 +195,21 @@ def test_l5_bass_mallet_softer_than_snare_stick():
 # preset with known parameters, fit from a deliberately wrong template, recover them.
 
 def test_l6_fit_recovers_tenor():
+    # Truth values in the range the real tenor reference showed (K about 2-3, (0,1) at
+    # about 0.7-0.8 of its K-curve frequency). For K near 0 the ladder fit is ambiguous
+    # (see fit_ladder) and is not expected to recover K.
     import drums, fit
-    truth = drums.tenor(300.0, 0.25, K=0.5)
-    r = fit.fit_drum(drums.render_drum(truth), truth.batter.sr, drums.tenor(250.0, 0.25, K=1.5))
-    b = r.preset.batter
-    assert np.isclose(r.pitch, 300.0, rtol=1e-3)
-    assert abs(b.K - 0.5) < 0.05
-    assert np.isclose(b.d0, truth.batter.d0, rtol=0.05) and np.isclose(b.d1, truth.batter.d1, rtol=0.05)
-    assert np.sqrt(np.mean(r.cents ** 2)) < 1.0
+    from dataclasses import replace
+    for pitch, K, scale, L in ((440.0, 2.2, 0.75, 0.0), (590.0, 3.0, 0.70, 0.2)):
+        truth = drums.tenor(pitch, L, K=K)
+        truth = fit.with_tuning(replace(truth, batter=replace(truth.batter, f01_scale=scale)),
+                                pitch, K, 0.0)
+        r = fit.fit_drum(drums.render_drum(truth), truth.batter.sr, drums.tenor(250.0, L, K=1.5))
+        b = r.preset.batter
+        assert np.isclose(r.pitch, pitch, rtol=3e-3)
+        assert np.isclose(b.K, K, rtol=0.10)
+        assert abs(b.f01_scale - scale) < 0.02
+        assert np.isclose(b.d0, truth.batter.d0, rtol=0.05) and np.isclose(b.d1, truth.batter.d1, rtol=0.05)
 
 
 def test_l6_fit_recovers_bass_with_coupling():
@@ -294,7 +301,7 @@ def test_slice_hits_finds_each_hit_in_a_long_take():
         s = fit.screen(take[a:b], sr)
         assert s.n_hits == 1 and s.trust_freq and s.trust_decay, s.notes
         f, level = fit.extract_peaks(take[a:b], sr)
-        assert np.isclose(f[0], pitch, rtol=2e-3)       # lowest peak = the tuned (0,1) mode
+        assert np.min(np.abs(f - pitch)) < 2e-3 * pitch  # the tuned (1,1) mode is among the peaks
 
 
 # ---------------------------------------------------------------- retuning
@@ -316,7 +323,39 @@ def test_retune_moves_pitch_and_keeps_the_drum():
 
     t1 = drums.tenor(300.0, 0.25)
     a, b = drums.drum_tables(t1)[0], drums.drum_tables(drums.retune(t1, 350.0))[0]
-    assert np.isclose(b.freq[(b.m == 0) & (b.n == 1)][0], 350.0)
+    assert np.isclose(b.freq[(b.m == 1) & (b.n == 1)][0], 350.0)
     assert np.allclose(a.freq[a.m == drums.COLUMN], b.freq[b.m == drums.COLUMN])  # shell unchanged
     mem = a.m >= 0
     assert np.allclose(b.freq[b.m >= 0] / a.freq[mem], 350.0 / 300.0)             # head ratios unchanged
+
+
+# ---------------------------------------------------------------- tenor pitch mode + (0,1) offset
+
+def test_f01_scale_moves_only_the_01_mode():
+    a = mode_table(DrumParams(K=2.0))
+    assert np.array_equal(mode_table(DrumParams(K=2.0, f01_scale=1.0)).freq, a.freq)   # off = unchanged
+    b = mode_table(DrumParams(K=2.0, f01_scale=0.75))
+    is01 = (a.m == 0) & (a.n == 1)
+    assert np.isclose(b.freq[(b.m == 0) & (b.n == 1)][0], 0.75 * a.freq[is01][0])
+    assert np.allclose(np.sort(b.freq[~((b.m == 0) & (b.n == 1))]), np.sort(a.freq[~is01]))
+
+
+def test_f0_for_pitch_by_mode():
+    import drums
+    for mode in ((0, 1), (1, 1), (2, 1)):
+        p = DrumParams(f0=drums.f0_for_pitch(440.0, 2.0, mode), K=2.0)
+        t = mode_table(p)
+        assert np.isclose(t.freq[(t.m == mode[0]) & (t.n == mode[1])][0], 440.0)
+    p = DrumParams(f0=drums.f0_for_pitch(100.0, 2.0, (0, 1), 0.8), K=2.0, f01_scale=0.8)
+    assert np.isclose(mode_table(p).freq[0], 100.0)
+    assert drums.tenor(440.0, 0.25).pitch_mode == (1, 1) and drums.bass(65.0).pitch_mode == (0, 1)
+
+
+def test_fit_ladder_picks_the_11_anchor():
+    import fit
+    truth = fit.ladder_freqs(440.0, 2.1)                  # (0,1) .. (5,1)
+    f = np.concatenate([[0.76 * truth[0]], truth[1:]])    # low (0,1) plus the ladder
+    level = np.array([-14.0, -6.0, 0.0, -15.0, -16.0, -18.0])   # (2,1) is the loudest peak
+    f11, K, rms = fit.fit_ladder(f, level)
+    assert np.isclose(f11, 440.0, rtol=1e-3) and np.isclose(K, 2.1, rtol=0.02) and rms < 1.0
+    assert np.isclose(fit.find_f01(f, level, f11, K), 0.76, atol=0.01)

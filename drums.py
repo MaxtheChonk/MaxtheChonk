@@ -24,6 +24,7 @@ class DrumPreset:
     name: str
     batter: DrumParams
     reso: Optional[DrumParams] = None  # None = single head (tenor)
+    pitch_mode: tuple = (0, 1)         # (m, n) of the batter mode that carries the tuned pitch
     coupling: float = 0.0              # two-head air coupling (Layer 4)
     # open-tube air column (tenors): f = n*c/(2*L_eff)
     column_L: float = 0.0              # m, effective tube length; 0 = off
@@ -45,19 +46,22 @@ class DrumPreset:
 
 # ------------------------------------------------------------------ helpers
 
-def f0_for_pitch(pitch_hz: float, K: float) -> float:
-    """In-vacuo f0 such that the air-loaded (0,1) mode sounds at pitch_hz."""
-    return pitch_hz * np.sqrt(1 + K / jn_zeros(0, 1)[0])
+def f0_for_pitch(pitch_hz: float, K: float, mode=(0, 1), f01_scale: float = 1.0) -> float:
+    """In-vacuo f0 such that the air-loaded (m, n) mode sounds at pitch_hz."""
+    m, n = mode
+    alpha = jn_zeros(m, n)[-1]
+    f0 = pitch_hz * jn_zeros(0, 1)[0] / alpha * np.sqrt(1 + K / alpha)
+    return f0 / f01_scale if mode == (0, 1) else f0
 
 
 def retune(d: "DrumPreset", pitch_hz: float) -> "DrumPreset":
-    """Same drum, new tuning. The batter's air-loaded (0,1) mode moves to pitch_hz.
+    """Same drum, new tuning. The batter's pitch mode (d.pitch_mode) moves to pitch_hz.
     Held fixed (properties of the drum, not the tuning): K, the reso/batter f0 ratio,
     the air column, and the ABSOLUTE air spring between the heads. `coupling` is
     relative to the head frequencies (k = coupling * fb_01 * fr_01), so it is rescaled
     by 1/s^2 to keep k unchanged. Decay (d0, d1) is NOT adjusted: it is only known at
     the fitted tuning."""
-    f0 = f0_for_pitch(pitch_hz, d.batter.K)
+    f0 = f0_for_pitch(pitch_hz, d.batter.K, d.pitch_mode, d.batter.f01_scale)
     s = f0 / d.batter.f0
     reso = None if d.reso is None else replace(d.reso, f0=d.reso.f0 * s)
     return replace(d, batter=replace(d.batter, f0=f0), reso=reso, coupling=d.coupling / s ** 2)
@@ -140,10 +144,12 @@ def snare(strike: str = "center", wires: bool = True) -> DrumPreset:
 
 
 def tenor(pitch_hz: float, L_eff: float, K: float = 0.5) -> DrumPreset:
-    """Tenor: single head, open-bottom shell as an open tube of length L_eff."""
-    batter = DrumParams(f0=f0_for_pitch(pitch_hz, K), K=K, M=8, N=4, r_s=0.5, r_p=0.3,
+    """Tenor: single head, open-bottom shell as an open tube of length L_eff.
+    Tuned by the (1,1) mode: on real tenors that is the strongest, pitch-carrying
+    partial (reference fit, see PROGRESS.md), not the (0,1) mode. L_eff = 0: no column."""
+    batter = DrumParams(f0=f0_for_pitch(pitch_hz, K, (1, 1)), K=K, M=8, N=4, r_s=0.5, r_p=0.3,
                         d0=8.0, d1=0.003, duration=1.5, contact_s=0.0005, fc=6000.0)
-    return DrumPreset(name="tenor_%gHz" % pitch_hz, batter=batter,
+    return DrumPreset(name="tenor_%gHz" % pitch_hz, batter=batter, pitch_mode=(1, 1),
                       column_L=L_eff, column_level=0.3)
 
 
@@ -153,3 +159,28 @@ def bass(pitch_hz: float, K: float = 2.0, coupling: float = 0.2) -> DrumPreset:
     head = DrumParams(f0=f0_for_pitch(pitch_hz, K), K=K, M=6, N=4, r_s=0.2, r_p=0.3,
                       d0=4.0, d1=0.01, duration=2.0, contact_s=0.004, fc=1500.0)
     return DrumPreset(name="bass_%gHz" % pitch_hz, batter=head, reso=head, coupling=coupling)
+
+
+# Fitted to the first real reference (TAMA Fieldstar tenor tuning tutorial, low-bitrate MP3,
+# see PROGRESS.md): (1,1) pitch in Hz, air loading K, (0,1) scale. Mean over the clean hits
+# found per drum (count in the comment). ONLY these three numbers are fitted; decay, mallet,
+# strike/pickup radii and the air column are still placeholders (tails were cut off and the
+# shell length is unknown), so the column is off. A sixth, higher drum (~757 Hz) was heard
+# in one ambiguous hit and is left out.
+REFERENCE_TENORS = [
+    (590.0, 3.2, 0.76),   # 3 hits, K 2.9-3.5
+    (522.0, 2.1, 0.72),   # 2 hits, K 2.1-2.2
+    (487.0, 1.7, 0.76),   # 1 hit
+    (440.0, 2.1, 0.77),   # 2 hits, K 2.1
+    (390.0, 1.8, 0.81),   # 1 hit
+]
+
+
+def reference_tenors():
+    """The five reference-fitted tenors, highest first."""
+    out = []
+    for pitch, K, scale in REFERENCE_TENORS:
+        d = tenor(pitch, 0.0, K=K)
+        batter = replace(d.batter, f01_scale=scale)
+        out.append(replace(d, batter=batter))
+    return out
