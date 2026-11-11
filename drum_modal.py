@@ -1,7 +1,7 @@
 """Modal synthesis core for marching percussion. Pure functions, no globals.
 
 Pipeline: DrumParams -> mode_table() -> render() -> write_wav() / plot_spectrum()
-See SPEC.md for the layer plan. Layers implemented so far: 1, 2, 3 (no doublets).
+See SPEC.md for the layer plan. Layers implemented so far: 1, 2, 3 (no doublets), 4.
 """
 from dataclasses import dataclass
 from typing import NamedTuple
@@ -78,6 +78,57 @@ def mode_table(p: DrumParams) -> ModeTable:
     m, n, freq, amp = m[order], n[order], freq[order], amp[order]
     amp = amp * strike_gain(freq, p)
     return ModeTable(m, n, freq, amp, p.d0 + p.d1 * freq)
+
+
+# ---------------------------------------------------------------- Layer 4
+
+def two_head_tables(pb: DrumParams, pr: DrumParams, coupling: float):
+    """Batter (pb) + resonant (pr) head coupled through the enclosed air.
+    Returns (batter_table, reso_table): motion at the batter pickup (pb.r_p) and at
+    the resonant-head pickup (pr.r_p), for a strike on the batter at pb.r_s.
+
+    Each (0,n) pair is two oscillators joined by an air spring, in f^2 units:
+        [[fb^2 + k, -k], [-k, fr^2 + k]],   k = coupling * fb_01 * fr_01
+    Eigenvalues -> two partials (in-phase: lower, out-of-phase: raised).
+    Eigenvector V[:, j] = (batter share, reso share) of partial j.
+    m>0 modes displace no net air volume and stay uncoupled; the resonant head's
+    m>0 modes are never excited (amp 0). Each table has 2N more rows than a
+    single head: every (0,n) appears twice."""
+    assert pb.N == pr.N
+    tb, tr = mode_table(pb), mode_table(pr)
+    fb, fr = tb.freq[tb.m == 0], tr.freq[tr.m == 0]        # ordered n = 1..N
+    alpha = jn_zeros(0, pb.N)
+    norm = np.pi * jv(1, alpha) ** 2
+    strike = jv(0, alpha * pb.r_s) / norm
+    shape_b = strike * jv(0, alpha * pb.r_p)               # strike -> batter pickup
+    shape_r = strike * jv(0, alpha * pr.r_p)               # strike -> reso pickup
+    k = coupling * fb[0] * fr[0]
+
+    n_out, f_out, ab, ar, dec = [], [], [], [], []
+    for i in range(pb.N):
+        w, V = np.linalg.eigh(np.array([[fb[i] ** 2 + k, -k], [-k, fr[i] ** 2 + k]]))
+        for j in range(2):
+            f = np.sqrt(w[j])
+            g = strike_gain(f, pb)
+            n_out.append(i + 1)
+            f_out.append(f)
+            ab.append(shape_b[i] * V[0, j] ** 2 * g)
+            ar.append(shape_r[i] * V[0, j] * V[1, j] * g)
+            # loss of each partial = energy-weighted mix of the two heads' losses
+            dec.append(V[0, j] ** 2 * (pb.d0 + pb.d1 * f) + V[1, j] ** 2 * (pr.d0 + pr.d1 * f))
+    n_out, f_out, dec = np.array(n_out), np.array(f_out), np.array(dec)
+
+    def merge(single: ModeTable, amp_m0, keep_amp: bool) -> ModeTable:
+        hi = single.m > 0
+        m = np.concatenate([single.m[hi], np.zeros_like(n_out)])
+        n = np.concatenate([single.n[hi], n_out])
+        freq = np.concatenate([single.freq[hi], f_out])
+        amp = np.concatenate([single.amp[hi] * keep_amp, amp_m0])
+        decay = np.concatenate([single.decay[hi], dec])
+        o = np.argsort(freq)
+        return ModeTable(m[o], n[o], freq[o], amp[o], decay[o])
+
+    return merge(tb, np.array(ab), True), merge(tr, np.array(ar), False)
 
 
 # ---------------------------------------------------------------- Layer 2

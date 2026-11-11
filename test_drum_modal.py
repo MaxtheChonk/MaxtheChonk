@@ -86,3 +86,43 @@ def test_l3_pitch_drop_zero_matches_layer2():
               for f, a, d in zip(tb.freq, tb.amp, tb.decay))
     assert np.allclose(render(tb, p), ref, atol=1e-12)
     assert not np.allclose(render(tb, DrumParams(drop=0.05)), ref, atol=1e-3)
+
+
+# ---------------------------------------------------------------- Layer 4
+
+def test_l4_zero_coupling_gives_independent_tables():
+    from drum_modal import two_head_tables
+    pb, pr = DrumParams(f0=200.0), DrumParams(f0=260.0, r_p=0.5, d0=5.0)
+    tb, tr = mode_table(pb), mode_table(pr)
+    bt, rt = two_head_tables(pb, pr, 0.0)
+    live = bt.amp != 0
+    # batter pickup hears exactly the single-head batter table
+    assert np.allclose(bt.freq[live], tb.freq, rtol=1e-12)
+    assert np.allclose(bt.amp[live], tb.amp, rtol=1e-12)
+    assert np.allclose(bt.decay[live], tb.decay, rtol=1e-12)
+    assert np.array_equal(bt.m[live], tb.m) and np.array_equal(bt.n[live], tb.n)
+    # resonant head: its own uncoupled frequencies, and never excited
+    assert np.all(rt.amp == 0)
+    assert np.allclose(rt.freq[rt.m > 0], tr.freq[tr.m > 0], rtol=1e-12)
+    assert np.allclose(np.sort(rt.freq[rt.m == 0]),
+                       np.sort(np.concatenate([tb.freq[tb.m == 0], tr.freq[tr.m == 0]])), rtol=1e-12)
+    # the silent partials in the batter table are the resonant (0,n) modes
+    assert np.allclose(bt.freq[~live], tr.freq[tr.m == 0], rtol=1e-12)
+
+
+def test_l4_coupling_splits_m0_only():
+    from drum_modal import two_head_tables
+    p = DrumParams()
+    t = mode_table(p)
+    c = 0.3
+    bt, rt = two_head_tables(p, p, c)                 # identical heads
+    f0n = t.freq[t.m == 0]
+    k = c * f0n[0] ** 2
+    pair = bt.freq[bt.m == 0]
+    lo = np.array([pair[bt.n[bt.m == 0] == n].min() for n in range(1, p.N + 1)])
+    hi = np.array([pair[bt.n[bt.m == 0] == n].max() for n in range(1, p.N + 1)])
+    assert np.allclose(lo, f0n)                       # in-phase: unchanged
+    assert np.allclose(hi, np.sqrt(f0n ** 2 + 2 * k)) # out-of-phase: raised
+    assert np.allclose(bt.freq[bt.m > 0], t.freq[t.m > 0])   # m>0 untouched
+    assert np.allclose(bt.amp[bt.m > 0], t.amp[t.m > 0])
+    assert np.any(rt.amp[rt.m == 0] != 0) and np.all(rt.amp[rt.m > 0] == 0)
