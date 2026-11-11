@@ -16,7 +16,7 @@ from scipy.optimize import least_squares
 from scipy.signal import butter, find_peaks, sosfilt, stft
 from scipy.special import jn_zeros
 
-from drums import DrumPreset, drum_tables, f0_for_pitch, render_drum
+from drums import DrumPreset, band_time_energy, drum_tables, f0_for_pitch, render_drum
 
 
 @dataclass
@@ -230,27 +230,31 @@ def ladder_freqs(f11, K, n_rungs=5):
 
 
 def fit_ladder(all_f, all_db, n_rungs=5, anchor_db=10.0, good_cents=20.0, clip=100.0):
-    """Fit (f11, K) to the (m,1) ladder, m = 1..n_rungs: the evenly stepping row of peaks
-    an edge-struck single head shows. Returns (f11, K, rms_cents).
+    """Fit K to the (m,1) ladder, m = 2..n_rungs, with (1,1) pinned to an anchor peak:
+    the evenly stepping row of peaks an edge-struck single head shows.
+    Returns (f11, K, rms_cents).
 
+    (1,1) is not fitted: its peak is measured directly, and letting it float lets weak
+    upper rungs (often buried in noise) pull the pitch.
     Anchor: the strongest peak is taken as (1,1), unless a lower strong peak (within
     anchor_db of it) has a ladder that fits within good_cents rms AND has the strongest
     peak as one of its rungs; then the lowest such peak is (1,1) and the strongest peak
     is a higher rung. A ladder started on an unrelated peak can fit by chance, but it
     will not pass through the strongest peak.
-    Robust loss: one rung matched to a neighbouring mode must not drag K.
+    Robust loss: one rung matched to a neighbouring mode or a noise peak must not drag K.
+    All rungs count equally: weighting by peak level was tried and made real hits worse
+    (real upper rungs are weak but genuine). The price: when the upper rungs are buried in
+    noise, K can be off by about 20% (seen on the model's own 587 Hz render with noise).
     Known ambiguity: for K near 0 the (m,2) modes also form a ladder that looks like a
     high-K (m,1) ladder; the fit cannot tell them apart from frequencies alone."""
-    def resid(th):
-        pred = ladder_freqs(*th, n_rungs)[1:]
-        return np.clip(_cents(pred, _nearest(all_f, pred)), -clip, clip)
-
     def fit_anchor(f11):
-        lo, hi = [f11 * 0.995, 0.0], [f11 * 1.005, 12.0]   # the anchor peak is measured directly
-        r = min((least_squares(resid, [f11, k0], bounds=(lo, hi), diff_step=1e-3,
+        def resid(k):
+            pred = ladder_freqs(f11, k[0], n_rungs)[2:]
+            return np.clip(_cents(pred, _nearest(all_f, pred)), -clip, clip)
+        r = min((least_squares(resid, [k0], bounds=([0.0], [12.0]), diff_step=1e-3,
                                loss="soft_l1", f_scale=8.0)
                  for k0 in (0.5, 2.0, 4.0, 7.0)), key=lambda r: r.cost)
-        return r.x[0], r.x[1], float(np.sqrt(np.mean(resid(r.x) ** 2)))
+        return f11, float(r.x[0]), float(np.sqrt(np.mean(resid(r.x) ** 2)))
 
     top = all_f[np.argmax(all_db)]
     for f11 in all_f[(all_db >= all_db.max() - anchor_db) & (all_f < top)]:
@@ -344,15 +348,6 @@ def align_to_attack(y, sr, lead_s=0.001):
     """Trim so the hit starts lead_s before the first sample above 20% of the peak."""
     on = int(np.argmax(np.abs(y) > 0.2 * np.max(np.abs(y))))
     return y[max(on - int(lead_s * sr), 0):]
-
-
-def band_time_energy(y, sr, bands, edges):
-    """Energy [band][slice]: band-pass, then sum of squares inside each time slice."""
-    out = []
-    for lo, hi in bands:
-        x = sosfilt(butter(4, [lo / (sr / 2), min(hi / (sr / 2), 0.99)], "band", output="sos"), y)
-        out.append([np.sum(x[int(a * sr):int(b * sr)] ** 2) / sr for a, b in zip(edges[:-1], edges[1:])])
-    return np.array(out)
 
 
 def measure_noise(y, sr, modal, bands, edges, floor_db=-80.0):

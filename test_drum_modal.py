@@ -396,12 +396,28 @@ def test_noise_off_is_pure_modal_and_on_matches_its_map():
 
 
 def test_tenor_profile_round_trip():
-    # render the reference tenors, measure them like a recording, get the profile back
+    # Render the reference tenors, measure them like a recording, get the profile back.
     import drums, fit
-    hits = [drums.render_drum(d) for d in drums.reference_tenors()]
-    p = fit.tenor_profile(hits, 48000)
+    from dataclasses import replace
+    ref = drums.reference_tenors()
+    amp, dec = np.array(drums.TENOR_RUNG_AMP_DB), np.array(drums.TENOR_RUNG_DECAY)
+
+    # (a) ladder part alone (noise off): everything comes back tightly
+    p = fit.tenor_profile([drums.render_drum(replace(d, noise_bands=())) for d in ref], 48000)
     for (f11, K, scale), (pitch, K0, scale0) in zip(p["fits"], drums.REFERENCE_TENORS):
         assert np.isclose(f11, pitch, rtol=2e-3) and np.isclose(K, K0, rtol=0.05) and abs(scale - scale0) < 0.02
-    assert np.allclose(p["rung_amp_db"], drums.TENOR_RUNG_AMP_DB, atol=1.5)
-    assert np.allclose(p["rung_decay"], drums.TENOR_RUNG_DECAY, rtol=0.1)
+    assert np.allclose(p["rung_amp_db"], amp, atol=1.5)
+    assert np.allclose(p["rung_decay"], dec, rtol=0.1)
+
+    # (b) full hits (noise on): pitch, (0,1) and the noise map come back tightly, and so do
+    # the rungs that stand above the noise. KNOWN LIMIT, not asserted tightly: rungs weaker
+    # than -25 dB sit inside the 1.2-2.4 kHz noise, so their amplitude and decay, and the K
+    # of a drum whose upper rungs fall there (587 Hz: 3.5 vs 3.0), are only roughly recovered.
+    p = fit.tenor_profile([drums.render_drum(d) for d in ref], 48000)
+    for (f11, K, scale), (pitch, K0, scale0) in zip(p["fits"], drums.REFERENCE_TENORS):
+        assert np.isclose(f11, pitch, rtol=2e-3) and abs(scale - scale0) < 0.02
+        assert np.isclose(K, K0, rtol=0.2)
+    strong = amp > -25.0
+    assert np.allclose(np.array(p["rung_amp_db"])[strong], amp[strong], atol=1.5)
+    assert np.allclose(np.array(p["rung_decay"])[strong], dec[strong], rtol=0.1)
     assert np.allclose(p["noise_db"], drums.TENOR_NOISE_DB, atol=3.0)

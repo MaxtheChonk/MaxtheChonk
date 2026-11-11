@@ -147,6 +147,13 @@ def modal_energy(t: ModeTable, T: float = np.inf) -> float:
     return float(np.sum(t.amp ** 2 * (1 - np.exp(-2 * t.decay * T)) / (4 * t.decay)))
 
 
+def band_filter(x, sr, lo, hi, order=8):
+    """Band-pass used for BOTH measuring and synthesising the noise map, so the two agree.
+    Steep (order 8) because neighbouring bands can differ by 15 dB or more: with gentler
+    skirts the louder band leaks into the quieter one and is counted twice."""
+    return sosfilt(butter(order, [lo / (sr / 2), min(hi / (sr / 2), 0.99)], "band", output="sos"), x)
+
+
 def _envelope(t, mid, log_a):
     """Log-amplitude through the nodes (mid, log_a): held before the first node, linear
     between nodes, last slope continued after the last node but never rising."""
@@ -154,34 +161,51 @@ def _envelope(t, mid, log_a):
     return np.where(t <= mid[-1], np.interp(t, mid, log_a), log_a[-1] + slope * (t - mid[-1]))
 
 
-def noise_signal(d: DrumPreset, table: ModeTable) -> np.ndarray:
+def band_time_energy(y, sr, bands, edges):
+    """Energy [band][slice]: band-pass (band_filter), then sum of squares inside each
+    time slice. This is THE definition of a noise map: fit.measure_noise uses it on
+    recordings and noise_signal calibrates against it."""
+    out = []
+    for lo, hi in bands:
+        x = band_filter(y, sr, lo, hi)
+        out.append([np.sum(x[int(a * sr):int(b * sr)] ** 2) / sr for a, b in zip(edges[:-1], edges[1:])])
+    return np.array(out)
+
+
+NOISE_INSET = 2 ** (1 / 6)   # each synthesis band stops 1/6 octave short of its edges
+
+
+def noise_signal(d: DrumPreset, table: ModeTable, n_iter: int = 15) -> np.ndarray:
     """Noise part of the hit from the measured noise map. Per band: white noise through a
     band-pass, times an envelope whose log-amplitude is interpolated between the slice
-    centres (held before the first, last slope continued after the last, never rising)."""
+    centres (_envelope). The envelope nodes are calibrated by analysis-by-synthesis:
+    the noise is measured with band_time_energy, exactly as a recording would be, and
+    the nodes are corrected until it shows the map. That absorbs filter delay, the
+    steep-fall overshoot inside long slices and what leaks between bands. Synthesis bands
+    are inset from the band edges, where two analysis bands overlap and a flat band of
+    noise would be counted in both. The calibrated nodes depend only on the preset, so a
+    real-time port can compute them offline."""
     p = d.batter
     n = int(p.sr * p.duration)
     t = np.arange(n) / p.sr
     edges = np.asarray(d.noise_edges, dtype=float)
     mid, dur = 0.5 * (edges[:-1] + edges[1:]), np.diff(edges)
-    ref = modal_energy(table, edges[-1])
+    target = modal_energy(table, edges[-1]) * 10 ** (np.asarray(d.noise_db) / 10)
     rng = np.random.default_rng(d.noise_seed)
-    y = np.zeros(n)
-    for (lo, hi), row in zip(d.noise_bands, d.noise_db):
-        x = sosfilt(butter(4, [lo / (p.sr / 2), min(hi / (p.sr / 2), 0.99)], "band", output="sos"),
-                    rng.standard_normal(n))
-        x /= np.sqrt(np.mean(x ** 2))
-        # unit-rms noise at amplitude A for dur seconds has energy A^2 * dur. Start from
-        # that, then correct the nodes until each slice of the interpolated envelope holds
-        # its target energy (a steep fall inside a long slice otherwise overshoots).
-        target = ref * 10 ** (np.asarray(row) / 10)
-        log_a = 0.5 * np.log(target / dur)
-        for _ in range(20):
-            env = _envelope(t, mid, log_a)
-            got = np.array([np.sum(np.exp(2 * env[int(a * p.sr):int(b * p.sr)])) / p.sr
-                            for a, b in zip(edges[:-1], edges[1:])])
-            log_a += 0.5 * np.log(target / got)
-        y += x * np.exp(_envelope(t, mid, log_a))
-    return y
+    lead = int(0.05 * p.sr)                      # let the filter settle before t = 0
+    raw = []
+    for lo, hi in d.noise_bands:
+        x = band_filter(rng.standard_normal(n + lead), p.sr, lo * NOISE_INSET, hi / NOISE_INSET)[lead:]
+        raw.append(x / np.sqrt(np.mean(x ** 2)))
+    log_a = 0.5 * np.log(target / dur)           # unit-rms noise at amplitude A: energy A^2 * dur
+
+    def synth():
+        return sum(x * np.exp(_envelope(t, mid, la)) for x, la in zip(raw, log_a))
+
+    for _ in range(n_iter):
+        got = band_time_energy(synth(), p.sr, d.noise_bands, edges)
+        log_a = log_a + np.clip(0.5 * np.log(target / np.maximum(got, 1e-300)), -1.5, 1.5)
+    return synth()
 
 
 def render_drum(d: DrumPreset) -> np.ndarray:
@@ -231,23 +255,23 @@ def bass(pitch_hz: float, K: float = 2.0, coupling: float = 0.2) -> DrumPreset:
 # clean hits found (count in the comment). A sixth, higher drum (~757 Hz) was heard in one
 # ambiguous hit and is left out. The air column is off (shell length unknown).
 REFERENCE_TENORS = [
-    (590.0, 3.2, 0.76),   # 3 hits, K 2.9-3.5
-    (522.0, 2.1, 0.72),   # 2 hits, K 2.1-2.2
-    (487.0, 1.7, 0.76),   # 1 hit
-    (440.0, 2.1, 0.77),   # 2 hits, K 2.1
-    (390.0, 1.8, 0.81),   # 1 hit
+    (587.0, 3.0, 0.78),   # 3 hits, K 2.7-3.3
+    (522.0, 2.2, 0.72),   # 2 hits, K 2.2
+    (485.0, 1.8, 0.76),   # 1 hit
+    (439.0, 2.15, 0.78),  # 2 hits, K 2.1-2.2
+    (390.0, 1.75, 0.81),  # 1 hit
 ]
 # Ladder profile and noise map, median over the same 8 hits (fit.tenor_profile).
 # One shared profile for all five drums: too few hits per drum to fit each separately.
 # Low confidence on decay (hits follow each other every 0.3-0.6 s, tails are cut).
-TENOR_RUNG_AMP_DB = (-9.5, 0.0, -10.7, -20.4, -31.8, -26.6, -34.7, -26.2)   # dB, m = 0..7
-TENOR_RUNG_DECAY = (13.3, 15.3, 9.1, 6.7, 5.5, 8.2, 6.3, 5.3)             # 1/s, m = 0..7
+TENOR_RUNG_AMP_DB = (-9.5, 0.0, -10.7, -20.4, -31.3, -26.6, -31.3, -28.5)   # dB, m = 0..7
+TENOR_RUNG_DECAY = (13.3, 15.3, 9.1, 6.7, 6.1, 8.2, 6.3, 5.3)             # 1/s, m = 0..7
 TENOR_NOISE_BANDS = ((1200.0, 2400.0), (2400.0, 4800.0), (4800.0, 9600.0))
 TENOR_NOISE_EDGES = (0.0, 0.003, 0.01, 0.03, 0.08, 0.2, 0.3)
 TENOR_NOISE_DB = (
-    (-24.0, -21.3, -17.9, -19.6, -21.1, -31.4),   # 1.2-2.4 kHz
-    (-26.0, -25.3, -21.1, -23.0, -28.5, -42.1),   # 2.4-4.8 kHz
-    (-32.9, -32.5, -29.0, -34.3, -45.4, -56.5),   # 4.8-9.6 kHz
+    (-27.0, -20.8, -17.7, -19.6, -20.7, -30.7),   # 1.2-2.4 kHz
+    (-26.8, -24.8, -21.2, -23.2, -28.5, -41.8),   # 2.4-4.8 kHz
+    (-33.6, -32.7, -29.6, -35.1, -46.5, -58.6),   # 4.8-9.6 kHz
 )
 
 
