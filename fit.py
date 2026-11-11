@@ -221,9 +221,11 @@ def freq_residuals(theta, d, meas_f, all_f, n_low=4, clip=200.0):
     return np.clip(np.concatenate([r1, r2]), -clip, clip)
 
 
-def fit_drum(y, sr, template: DrumPreset, n_peaks=10, fmax=None, nperseg=4096) -> FitResult:
-    """Fit pitch (-> f0), K, coupling to peak frequencies, then d0, d1 to peak decays."""
-    all_f, all_db = extract_peaks(y, sr, fmax=fmax)
+def fit_drum(y, sr, template: DrumPreset, n_peaks=10, fmin=30.0, fmax=None, nperseg=4096,
+             floor_db=-60.0) -> FitResult:
+    """Fit pitch (-> f0), K, coupling to peak frequencies, then d0, d1 to peak decays.
+    Raise fmin above mains hum / rumble and floor_db above the noise floor for real takes."""
+    all_f, all_db = extract_peaks(y, sr, fmin=fmin, fmax=fmax, floor_db=floor_db)
     strongest = np.sort(np.argsort(-all_db)[:n_peaks])
     meas_f = all_f[strongest]
     two = template.reso is not None

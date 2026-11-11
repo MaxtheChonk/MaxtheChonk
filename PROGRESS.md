@@ -19,7 +19,7 @@
   in demo.py to fit and print reports.
 
 ## Test results
-Last run `python -m pytest -q` -> 23 passed
+Last run `python -m pytest -q` -> 23 passed (re-run after adding fmin/floor_db to fit_drum)
 - L1 (3), L2 (1), L3 (4), L4 (2), L5 (6), L6 (3), screening (2), slicer (1), retune (1)
 - History: test_l6_fit_recovers_snare_modal_and_wires failed once (wire threshold 0.098 vs
   0.15). Fixed in the fitter, tolerance unchanged: `band_map` went from 10 bands x 8 frames to
@@ -100,20 +100,34 @@ Last run `python -m pytest -q` -> 23 passed
 - L2-style 1-bin peak tests need low decay; heavy-decay presets merge neighbouring lines.
 - Dependencies not pinned: numpy scipy matplotlib soundfile pytest.
 
+## First real reference: findings (tenors)
+Source: user-supplied MP3 of "Roger Carter Fieldstar Tenor Tuning Tutorial" (TAMA), 1041 s,
+84 kbps, stereo. Audio is NOT in the repo (lives only in the session scratchpad; ask the user
+to re-upload in a new session). Mostly speech; constant 120 Hz mains hum (use fmin=150).
+Drum-only passages: ~669-671 s, 716-724 s, 750-768 s, 870-881 s, 1000-1022 s.
+- `slice_hits` + `screen` alone cannot separate drum taps from speech on this file; the
+  passages were found by eye on a spectrogram. Hits follow each other every 0.3-0.6 s, so
+  tails are cut short: decay numbers from this file are NOT trusted.
+- Six drums (a sextet). Strongest peak of each: ~390, 440, 487, 522, 590, 757 Hz.
+- Every drum shows the same peak ladder from its strongest peak: 1 : 1.43 : 1.82 : 2.21 : 2.57.
+  This matches the air-loaded (m,1) series, m = 1..5, anchored at (1,1):
+  fitting (f11, K) to those 5 peaks gives 3-13 cents rms on 10 hits, with K = 1.7 .. 3.3
+  (2 parameters, 5 peaks, K scatters between hits of the same drum).
+- So on real tenors the STRONGEST / pitch-defining mode is (1,1), not (0,1). The presets and
+  `f0_for_pitch` currently tune by (0,1): this is wrong for tenors and must change.
+- The (0,1) mode is not explained: the model puts it at 224-432 Hz, the recordings show low
+  peaks around 183-271 Hz (or nothing clear). Likely extra lowering by the air in the shell,
+  which f = f_ideal/sqrt(1+K/alpha) cannot produce (it caps (1,1)/(0,1) at 2.01).
+  Peaks near 195/213/245/271 Hz also appear in hits on OTHER drums (sympathetic ringing).
+- Generic `fit_drum` on these hits: 15-60 cents rms and inconsistent K (0.7 vs 2.1 for the same
+  drum), because nearest-partial matching in a dense mode set is ambiguous. Not usable as is.
+- `fit_drum` gained `fmin` and `floor_db` arguments for real takes.
+
 ## Exact next step
-BLOCKED on audio. First reference chosen by the user: YouTube "Roger Carter Fieldstar Tenor
-Tuning Tutorial" (TAMA - Bergerault USA, 1041 s), https://youtu.be/BpVNv8RxO0o
-Cloud environment "MaxtheChonk" allows www.youtube.com, but the audio is served from
-per-request *.googlevideo.com hosts and only exact hosts can be allowed from a session.
-Unblock by either: (a) user adds `*.googlevideo.com` under Allowed domains in the
-environment settings, or (b) user supplies the audio file. Keep audio OUT of the repo.
-Then:
-1. Convert to mono WAV, `fit.slice_hits`, `fit.screen` each slice, group slices by lowest peak
-   (= drum pitch), list the kept slices with timestamps for the user to confirm which drum.
-2. Fit one tenor first (`fit.fit_drum` with a `drums.tenor(pitch, L_eff)` template). Needs
-   shell length L_eff from the user or the drum's spec sheet.
-3. Write only trusted fitted numbers into drums.py.
-User is on mobile and cannot edit the environment there; expect (a) from a computer later
-or (b) an uploaded audio file. Shell depth unknown to the user: look up the TAMA Fieldstar
-spec, else fit L_eff from non-membrane peaks, else leave the column off.
-Still open: named tuning sets per corps style (need pitches from the user).
+Decisions needed from the user before changing the model (not in SPEC):
+1. Tune tenors by the (1,1) mode instead of (0,1).
+2. Give (0,1) its own frequency offset knob (fitted), instead of forcing it onto the K curve.
+3. Make `fit_drum` for tenors fit the (m,1) ladder first (anchor at the strongest peak), then
+   assign the remaining peaks.
+After that: write fitted K and the six pitches into a tenor preset, flagged "decay untrusted".
+Still open: named tuning sets, bass and snare references, cleaner tenor audio for decay.
