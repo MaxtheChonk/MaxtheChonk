@@ -137,8 +137,29 @@ Drum-only passages: ~669-671 s, 716-724 s, 750-768 s, 870-881 s, 1000-1022 s.
 - (0,1) identification is low confidence: neighbouring drums ring in the same range.
 - Generic (non-ladder) `fit_drum` on these hits was unusable: 15-60 cents, inconsistent K.
 
+## Why the fitted tenors do not sound like tenors yet (measured, same 8 hits)
+User verdict on `tenor_sweep.wav`: right notes, not a tenor. Measured against the model:
+- Ladder rung levels, median dB for m = 0..7: -11, 0, -7, -10, -26, -18, -24, -21.
+  Ladder rungs carry 58-83% of the energy (32-40% on the 590 Hz drum). Peaks that are not
+  rungs sit around -34 dB. The model (point strike x point pickup, SPEC Layer 1 amps) makes
+  (m, n>=2) modes far too loud between 1 and 4 kHz.
+- Fitting r_s, r_p to the levels: 17 dB rms (placeholder) -> 14.5 dB, flat minimum. Adding a
+  per-nodal-circle suppression: best 11.4 dB at 10 dB/circle. Neither is a usable fit: the
+  SPEC amplitude formula does not describe these recordings.
+- Ladder rung decay, median 1/s for m = 0..7: 13, 15, 9, 7, 5.5, 8, 6, 5. Low modes decay
+  FASTER than high rungs, opposite to d0 + d1*f with d1 > 0. Low confidence (tails cut).
+- Energy above 4 kHz: -22 dB of the total, decaying at ~28 1/s. The model has about -50 dB
+  there (M=8, N=4 stops near 3 kHz and has no attack component).
+- A/B test files rendered for the user (scratch script, NOT in the repo; outputs in out/):
+  A current model, B measured rung levels + decays only, C = B + band-limited noise for the
+  >4 kHz attack, D the real hits. Waiting for the user's ears on which gap matters.
+
 ## Exact next step
-Tenors: need cleaner audio for decay (isolated hits that ring out > 1 s), shell depth for the
+Get the user's verdict on A/B/C/D. If B or C sounds like a tenor, decide (user approval
+needed, departs from SPEC) how amplitudes and decay should be modelled: e.g. per-rung gain
+and decay tables fitted to the reference on top of the Bessel strike/pickup term, and an
+attack component. Do not adopt by ear alone: the tables must come from measurements.
+Tenors also need cleaner audio for decay (isolated hits that ring out > 1 s), shell depth for the
 air column, and a hit recorded with a known strike spot to set r_s / r_p.
 Then bass drums (two heads, uses the old fit path: expect the same nearest-partial ambiguity
 on real audio, consider a ladder-style fit there too), then snare (needs a snares-off hit).
