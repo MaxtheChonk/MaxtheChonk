@@ -1,7 +1,7 @@
 """Modal synthesis core for marching percussion. Pure functions, no globals.
 
 Pipeline: DrumParams -> mode_table() -> render() -> write_wav() / plot_spectrum()
-See SPEC.md for the layer plan. Layers implemented so far: 1, 2.
+See SPEC.md for the layer plan. Layers implemented so far: 1, 2, 3 (no doublets).
 """
 from dataclasses import dataclass
 from typing import NamedTuple
@@ -23,6 +23,13 @@ class DrumParams:
     d1: float = 0.001      # 1/s per Hz, frequency-dependent decay rate
     sr: int = 48000        # Hz
     duration: float = 2.0  # s
+    # Layer 3: shared physics knobs (defaults = off, i.e. identical to Layers 1-2)
+    tension: float = 1.0       # relative head tension; f scales as sqrt(tension)
+    K: float = 0.0             # air loading; f = f_ideal / sqrt(1 + K/alpha_mn)
+    contact_s: float = 0.0     # s, raised-cosine force pulse duration (0 = impulse)
+    fc: float = float("inf")   # Hz, stick rolloff exp(-(f/fc)^2) on amps
+    drop: float = 0.0          # pitch drop depth; f(t) = f*(1 + drop*exp(-t/tau_d))
+    tau_d: float = 0.05        # s, pitch drop time constant
 
 
 class ModeTable(NamedTuple):
@@ -34,22 +41,42 @@ class ModeTable(NamedTuple):
     decay: np.ndarray  # 1/s, envelope = exp(-decay * t)
 
 
+# ---------------------------------------------------------------- Layer 3
+
+def pulse_gain(freq: np.ndarray, contact_s: float) -> np.ndarray:
+    """Spectrum of a raised-cosine force pulse of duration contact_s, unity at DC.
+    F(x) = sinc(x) / (1 - x^2), x = f * contact_s (limit 1/2 at x = 1).
+    Signed: negative lobes flip the phase of that mode."""
+    x = np.asarray(freq, dtype=float) * contact_s
+    den = 1 - x ** 2
+    safe = np.abs(den) > 1e-9
+    return np.where(safe, np.sinc(x) / np.where(safe, den, 1.0), 0.5)
+
+
+def strike_gain(freq: np.ndarray, p: DrumParams) -> np.ndarray:
+    """Per-mode amp factor from the mallet: contact pulse spectrum * rolloff."""
+    return pulse_gain(freq, p.contact_s) * np.exp(-(np.asarray(freq) / p.fc) ** 2)
+
+
 # ---------------------------------------------------------------- Layer 1
 
 def mode_table(p: DrumParams) -> ModeTable:
-    """Ideal circular membrane: Bessel-zero frequencies, strike/pickup amps."""
+    """Circular membrane: Bessel-zero frequencies, strike/pickup amps.
+    Layer 3 knobs applied here: tension, air loading K, mallet (contact_s, fc)."""
     alpha_01 = jn_zeros(0, 1)[0]
+    f0 = p.f0 * np.sqrt(p.tension)
     ms, ns, freqs, amps = [], [], [], []
     for m in range(p.M + 1):
         alpha = jn_zeros(m, p.N)                       # alpha_m1..alpha_mN
         norm = (np.pi if m == 0 else np.pi / 2) * jv(m + 1, alpha) ** 2
         ms.append(np.full(p.N, m))
         ns.append(np.arange(1, p.N + 1))
-        freqs.append(p.f0 * alpha / alpha_01)
+        freqs.append(f0 * alpha / alpha_01 / np.sqrt(1 + p.K / alpha))
         amps.append(jv(m, alpha * p.r_s) * jv(m, alpha * p.r_p) / norm)
     m, n, freq, amp = (np.concatenate(x) for x in (ms, ns, freqs, amps))
     order = np.argsort(freq)
     m, n, freq, amp = m[order], n[order], freq[order], amp[order]
+    amp = amp * strike_gain(freq, p)
     return ModeTable(m, n, freq, amp, p.d0 + p.d1 * freq)
 
 
@@ -57,12 +84,15 @@ def mode_table(p: DrumParams) -> ModeTable:
 
 def render(table: ModeTable, p: DrumParams) -> np.ndarray:
     """Sum of exponentially decaying sines. Modes above Nyquist are skipped.
-    Output is NOT normalized (raw sum of table amps)."""
+    Output is NOT normalized (raw sum of table amps).
+    Pitch drop: f(t) = f*(1 + drop*exp(-t/tau_d)); phase is its exact integral,
+    2*pi*f*tw with warped time tw = t + drop*tau_d*(1 - exp(-t/tau_d))."""
     t = np.arange(int(p.sr * p.duration)) / p.sr
+    tw = t if p.drop == 0 else t + p.drop * p.tau_d * (1 - np.exp(-t / p.tau_d))
     y = np.zeros_like(t)
     for f, a, d in zip(table.freq, table.amp, table.decay):
-        if f < p.sr / 2:
-            y += a * np.exp(-d * t) * np.sin(2 * np.pi * f * t)
+        if f * (1 + max(p.drop, 0.0)) < p.sr / 2:
+            y += a * np.exp(-d * t) * np.sin(2 * np.pi * f * tw)
     return y
 
 

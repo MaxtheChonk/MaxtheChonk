@@ -41,3 +41,48 @@ def test_l2_fft_peaks_match_top8_modes():
     for i in top_modes(t, 8):
         nearest = peak_freqs[np.argmin(np.abs(peak_freqs - t.freq[i]))]
         assert abs(nearest - t.freq[i]) <= bin_hz, (t.m[i], t.n[i], t.freq[i], nearest)
+
+
+# ---------------------------------------------------------------- Layer 3
+
+def test_l3_tension_keeps_ratios():
+    a, b = mode_table(DrumParams()), mode_table(DrumParams(tension=2.0))
+    assert np.allclose(b.freq / b.freq[0], a.freq / a.freq[0], rtol=1e-12)
+    assert np.isclose(b.freq[0], a.freq[0] * np.sqrt(2.0))
+    assert np.array_equal(a.amp, b.amp)
+
+
+def test_l3_air_loading():
+    ideal = mode_table(DrumParams())
+    assert np.array_equal(mode_table(DrumParams(K=0.0)).freq, ideal.freq)   # K=0 == Layer 1
+    loaded = mode_table(DrumParams(K=2.0))
+    assert np.array_equal(loaded.m, ideal.m) and np.array_equal(loaded.n, ideal.n)
+    shift = loaded.freq / ideal.freq
+    assert np.all(shift < 1)                      # every mode lowered
+    assert np.all(np.diff(shift) > -1e-12)        # low modes lowered the most
+    assert shift[0] < shift[-1]
+    r_ideal, r_loaded = ideal.freq / ideal.freq[0], loaded.freq / loaded.freq[0]
+    assert np.all(r_loaded[1:] > r_ideal[1:])     # ratios stretch upward
+
+
+def test_l3_longer_contact_less_hf():
+    def hf_energy(contact_s):
+        t = mode_table(DrumParams(contact_s=contact_s))
+        return np.sum(t.amp[t.freq > 1000.0] ** 2)
+    assert hf_energy(0.0) > hf_energy(0.0005) > hf_energy(0.003)
+    # knobs off == Layer 1 amps; fc rolloff only ever reduces |amp|
+    base = mode_table(DrumParams())
+    soft = mode_table(DrumParams(fc=800.0))
+    assert np.all(np.abs(soft.amp) <= np.abs(base.amp))
+    assert np.allclose(soft.amp, base.amp * np.exp(-(base.freq / 800.0) ** 2))
+
+
+def test_l3_pitch_drop_zero_matches_layer2():
+    from drum_modal import render
+    p = DrumParams(drop=0.0)
+    tb = mode_table(p)
+    t = np.arange(int(p.sr * p.duration)) / p.sr
+    ref = sum(a * np.exp(-d * t) * np.sin(2 * np.pi * f * t)
+              for f, a, d in zip(tb.freq, tb.amp, tb.decay))
+    assert np.allclose(render(tb, p), ref, atol=1e-12)
+    assert not np.allclose(render(tb, DrumParams(drop=0.05)), ref, atol=1e-3)
