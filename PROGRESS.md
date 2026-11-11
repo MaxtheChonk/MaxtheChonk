@@ -7,18 +7,18 @@
 - Layer 4: two-head coupling (`two_head_tables(pb, pr, coupling) -> (batter_table, reso_table)`)
 - Layer 5: `drums.py` with `DrumPreset`, `snare()`, `tenor()`, `bass()`, `drum_tables`, `render_drum`
 - Layer 6: `fit.py` (`extract_peaks`, `measure_decays`, `fit_drum`, `fit_wires`, `report`).
-  Code complete, ONE TEST FAILING (see Known issues). Not yet run on real recordings: none supplied.
+  Checked on synthetic hits only: no reference recordings supplied yet.
+- Reference screening (not in SPEC, user-approved): `fit.screen(y, sr) -> Screen`. Runs inside
+  `fit_drum`; `report` prints a TRUST line for pitch/K/coupling and for decay/wires.
 - `demo.py`: all SPEC deliverables render into `out/` (gitignored). Add paths to `REFERENCES`
   in demo.py to fit and print reports.
 
 ## Test results
-Last run `python -m pytest -q` -> 18 passed, 1 FAILED
-- L1 (3), L2 (1), L3 (4), L4 (2), L5 (6): all pass
-- L6: test_l6_fit_recovers_tenor PASS, test_l6_fit_recovers_bass_with_coupling PASS,
-  test_l6_fit_recovers_snare_modal_and_wires FAIL at the wire-threshold assert:
-  fitted threshold 0.098 vs true 0.15 (tolerance 0.05, missed by 0.002). Modal part of that
-  test passed. Fitted brightness 3261 vs 4000, level 0.695 vs 0.8 (asserts not reached).
-  Per SPEC rules: stopped, tolerance NOT loosened, test NOT skipped.
+Last run `python -m pytest -q` -> 21 passed
+- L1 (3), L2 (1), L3 (4), L4 (2), L5 (6), L6 (3), screening (2)
+- History: test_l6_fit_recovers_snare_modal_and_wires failed once (wire threshold 0.098 vs
+  0.15). Fixed in the fitter, tolerance unchanged: `band_map` went from 10 bands x 8 frames to
+  6 bands x 40 frames, because the threshold shows up as WHEN the wire noise cuts off.
 
 ## Code map
 - `DrumParams` dataclass: every knob. Add new knobs here with defaults that mean "off"
@@ -77,16 +77,18 @@ Last run `python -m pytest -q` -> 18 passed, 1 FAILED
 - L6 test tolerances were set from what the fitter achieves on synthetic hits (SPEC has no
   Layer 6 test). They are regression bounds, not physics.
 
+- Screening thresholds (snr 40 dB, tail -40 dB, decay ratio 0.6..1.6, onset = 10 dB jump in
+  30 ms above 1 kHz) are heuristics, validated only on synthetic degradations.
+
 ## Known issues
-- FAILING: test_l6_fit_recovers_snare_modal_and_wires (wire threshold). Most likely cause:
-  wire_threshold and wire_level are nearly degenerate in the coarse band map (a higher
-  threshold with a higher level looks almost the same), and the reference uses a different
-  noise seed, so the optimum sits in a flat valley. Both synthetic runs showed the same bias
-  (threshold and level both fitted low). Likely fix: fit level from total wire-band energy
-  first, then threshold from the time at which that band's energy cuts off; or use a finer
-  time axis in `band_map`.
+- User has only SAMPLES (no raw recordings). Expect pitch, K, coupling to be usable and
+  decay / wire numbers to be flagged untrusted on processed samples.
+- Screening misses reverb that is quieter or shorter than the drum's own tail (synthetic:
+  caught on snare, missed on tenor and bass). It also cannot see EQ, or clipping that was
+  followed by other processing.
 - Snare modal fit must use a snares-OFF hit. With wires on, noise peaks pollute the peak list
   (synthetic check: ~100 cents rms error).
+- Wire fit on synthetic: threshold within 0.01, brightness within ~13%, level within ~25%.
 - Decay fit is biased when two partials share an STFT bin (beating). Seen on bass 65 Hz
   synthetic: d0 2.9 vs 4.0, d1 0.0122 vs 0.0100. Bass 98 Hz recovered within 1%.
 - Snare center strike excites few partials: coupling recovered as 0.17 vs 0.20 (11.7 cents rms).
@@ -94,8 +96,8 @@ Last run `python -m pytest -q` -> 18 passed, 1 FAILED
 - Dependencies not pinned: numpy scipy matplotlib soundfile pytest.
 
 ## Exact next step
-1. Fix the wire fit (see first known issue), run pytest once, expect 19 passed.
-2. Get from the user: reference WAV paths, tenor pitches (4-5), bass pitches (5), tenor shell
+1. Get from the user: sample WAV paths, tenor pitches (4-5), bass pitches (5), tenor shell
    lengths. Put paths in `REFERENCES` in demo.py, pitches/lengths in the constants above it.
-3. Run `python demo.py`, review the printed predicted-vs-measured tables, then write the
-   fitted numbers into the preset builders in drums.py.
+2. Run `python demo.py`, read each printed report including its TRUST line.
+3. Write only the trusted fitted numbers into the preset builders in drums.py; leave
+   untrusted ones as labelled placeholders.

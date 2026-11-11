@@ -13,7 +13,7 @@ from itertools import product
 
 import numpy as np
 from scipy.optimize import least_squares
-from scipy.signal import find_peaks, stft
+from scipy.signal import butter, find_peaks, sosfilt, stft
 
 from drums import DrumPreset, drum_tables, f0_for_pitch, render_drum
 
@@ -26,7 +26,23 @@ class FitResult:
     pred_f: np.ndarray        # Hz, nearest predicted partial for each measured peak
     cents: np.ndarray         # 1200*log2(pred/meas)
     meas_decay: np.ndarray    # 1/s, measured decay rate per peak (nan = not measurable)
+    screen: "Screen" = None   # quality check of the reference file
     wire_err_db: float = float("nan")   # rms band error after fit_wires
+
+
+@dataclass
+class Screen:
+    """Quality check of a reference hit. The thresholds are screening heuristics,
+    not physics; they only decide which fitted numbers to trust."""
+    clipped: bool         # flat-topped samples at full scale
+    n_hits: int           # onsets found (should be 1)
+    snr_db: float         # peak frame level over noise floor
+    tail_db: float        # level of the last 50 ms relative to the peak frame
+    decay_ratio: float    # median late/early decay slope of the strongest partials;
+                          # 1 = exponential, <1 = tail too slow (reverb), >1 = start too slow (compression)
+    trust_freq: bool      # pitch, K, coupling
+    trust_decay: bool     # d0, d1 and wire parameters
+    notes: list
 
 
 # ------------------------------------------------------------------ measurement
@@ -53,20 +69,99 @@ def extract_peaks(y, sr, fmin=30.0, fmax=None, prominence_db=10.0, floor_db=-60.
     return f[keep], (b - 0.25 * (a - c) * off)[keep]
 
 
-def measure_decays(y, sr, freqs, nperseg=4096, span_db=30.0):
-    """Decay rate (1/s) of each partial: slope of log |STFT bin| after its maximum,
-    over the first span_db of decay. nan where fewer than 4 frames are usable."""
+def _partial_decays(y, sr, freqs, nperseg, span_db):
+    """For each partial: (t, log envelope) of its STFT bin from its maximum down to
+    span_db below it. Shared by measure_decays and decay_ratio."""
     hop = nperseg // 8
     _, t, Z = stft(y, sr, nperseg=nperseg, noverlap=nperseg - hop, boundary=None, padded=False)
-    out = np.full(len(freqs), np.nan)
-    for i, f in enumerate(freqs):
+    for f in freqs:
         env = np.abs(Z[int(round(f * nperseg / sr))])
         i0 = int(np.argmax(env))
         below = np.nonzero(env[i0:] < env[i0] * 10 ** (-span_db / 20))[0]
         i1 = i0 + (below[0] if len(below) else len(env) - i0)
-        if i1 - i0 >= 4:
-            out[i] = -np.polyfit(t[i0:i1], np.log(env[i0:i1]), 1)[0]
-    return out
+        yield t[i0:i1], np.log(env[i0:i1] + 1e-300)
+
+
+def measure_decays(y, sr, freqs, nperseg=4096, span_db=30.0):
+    """Decay rate (1/s) of each partial: slope of log |STFT bin| after its maximum,
+    over the first span_db of decay. nan where fewer than 4 frames are usable."""
+    return np.array([-np.polyfit(t, e, 1)[0] if len(t) >= 4 else np.nan
+                     for t, e in _partial_decays(y, sr, freqs, nperseg, span_db)])
+
+
+def decay_ratio(y, sr, freqs, nperseg=4096, span_db=30.0):
+    """Median over partials of (late decay slope / early decay slope), splitting each
+    partial's first span_db of decay at its halfway level. 1 = exponential decay."""
+    ratios = []
+    for t, e in _partial_decays(y, sr, freqs, nperseg, span_db):
+        if len(t) < 6:
+            continue
+        early = e > e[0] - 0.5 * span_db * np.log(10) / 20
+        k = int(np.argmin(early)) if not early.all() else len(t)
+        if k >= 3 and len(t) - k >= 3:
+            a, b = np.polyfit(t[:k], e[:k], 1)[0], np.polyfit(t[k:], e[k:], 1)[0]
+            if a < 0:
+                ratios.append(b / a)
+    return float(np.median(ratios)) if ratios else float("nan")
+
+
+def screen(y, sr, nperseg=4096, min_snr_db=40.0, max_tail_db=-40.0, ratio_range=(0.6, 1.6)) -> Screen:
+    """Check a reference hit before trusting a fit to it."""
+    peak = np.max(np.abs(y))
+    # clipping: runs of samples stuck at full scale
+    flat = np.abs(y) >= peak * (1 - 1e-4)
+    edges = np.diff(np.concatenate([[0], flat.astype(int), [0]]))
+    runs = np.nonzero(edges == -1)[0] - np.nonzero(edges == 1)[0]
+    clipped = bool(np.sum(runs >= 3) >= 2 or np.any(runs >= 8))
+
+    # frame levels (10 ms rms, 5 ms hop), 50 ms of silence in front so a file that
+    # starts on the attack still shows one onset
+    hop = int(0.005 * sr)
+
+    def frame_db(x):
+        pad = np.concatenate([np.zeros(10 * hop), x])
+        n = (len(pad) - 2 * hop) // hop
+        rms = np.array([np.sqrt(np.mean(pad[i * hop:i * hop + 2 * hop] ** 2)) for i in range(n)])
+        return 20 * np.log10(rms / rms.max() + 1e-10)
+
+    def onsets(d):
+        # level jumps 10 dB within 30 ms, to within 30 dB of the peak
+        rise = np.array([d[i] - d[max(0, i - 6):i].min() if i else 0.0 for i in range(len(d))])
+        return np.nonzero((rise > 10) & (d > -30))[0]
+
+    db = frame_db(y)
+    # count hits above 1 kHz: an attack is broadband, while the slow beating of two
+    # close low partials (coupled heads) also makes the level jump but only down low
+    on = onsets(frame_db(sosfilt(butter(4, 1000.0 / (sr / 2), "high", output="sos"), y)))
+    if len(on) == 0:
+        on = onsets(db)
+    n_hits = int(np.sum(np.diff(on) > 10) + 1) if len(on) else 0   # merge within 50 ms
+
+    first = on[0] if len(on) else 0
+    tail_db = float(db[-10:].mean())
+    # noise floor: before the attack if the file has a lead-in, else the tail
+    lead = db[10:first - 2]
+    noise_db = float(lead.mean()) if len(lead) >= 4 else tail_db
+    snr_db = -noise_db
+
+    f, level = extract_peaks(y, sr)
+    ratio = decay_ratio(y, sr, f[np.argsort(-level)[:6]], nperseg=nperseg) if len(f) else float("nan")
+
+    notes = []
+    if clipped:
+        notes.append("clipped: adds false harmonics")
+    if n_hits != 1:
+        notes.append("%d hits found, need exactly 1" % n_hits)
+    if snr_db < min_snr_db:
+        notes.append("noise floor only %.0f dB below peak (want %.0f)" % (snr_db, min_snr_db))
+    if tail_db > max_tail_db:
+        notes.append("tail still at %.0f dB at end of file: cut off, noisy or reverberant" % tail_db)
+    if not ratio_range[0] <= ratio <= ratio_range[1]:
+        notes.append("decay not exponential (late/early slope %.2f): %s" % (
+            ratio, "reverb or room" if ratio < 1 else "compression" if ratio > 1 else "not measurable"))
+    trust_freq = not clipped and snr_db >= 30.0
+    trust_decay = not notes
+    return Screen(clipped, n_hits, snr_db, tail_db, ratio, trust_freq, trust_decay, notes)
 
 
 # ------------------------------------------------------------------ frequency fit
@@ -136,14 +231,17 @@ def fit_drum(y, sr, template: DrumPreset, n_peaks=10, fmax=None, nperseg=4096) -
                      reso=None if not two else replace(fitted.reso, d0=d0, d1=d1))
 
     pred_f = _nearest(audible_freqs(fitted), meas_f)
-    return FitResult(fitted, pitch, meas_f, pred_f, _cents(pred_f, meas_f), dec)
+    return FitResult(fitted, pitch, meas_f, pred_f, _cents(pred_f, meas_f), dec,
+                     screen(y, sr, nperseg=nperseg))
 
 
 # ------------------------------------------------------------------ wire fit (snare)
 
-def band_map(y, sr, n_bands=10, n_frames=8, fmin=200.0, floor_db=-60.0):
-    """Coarse log-band x time energy map in dB relative to its maximum.
-    Coarse enough to average over the wire noise, fine enough to see its gating."""
+def band_map(y, sr, n_bands=6, n_frames=40, fmin=200.0, floor_db=-60.0):
+    """Log-band x time energy map in dB relative to its maximum.
+    Wide bands average over the wire noise; many time frames are needed because
+    wire_threshold shows up as WHEN the noise cuts off (level alone cannot tell
+    threshold from wire_level)."""
     _, _, Z = stft(y, sr, nperseg=1024, boundary=None, padded=False)
     P = np.abs(Z) ** 2
     f = np.fft.rfftfreq(1024, 1 / sr)
@@ -188,4 +286,11 @@ def report(res: FitResult) -> str:
     for fm, fp, c, dm in zip(res.meas_f, res.pred_f, res.cents, res.meas_decay):
         lines.append("%10.2f %10.2f %8.1f %10.2f %10.2f" % (fm, fp, c, dm, d.batter.d0 + d.batter.d1 * fm))
     lines.append("rms freq error: %.1f cents" % np.sqrt(np.mean(res.cents ** 2)))
+    if res.screen is not None:
+        sc = res.screen
+        lines.append("reference check: hits=%d  snr=%.0f dB  tail=%.0f dB  decay ratio=%.2f  clipped=%s"
+                     % (sc.n_hits, sc.snr_db, sc.tail_db, sc.decay_ratio, sc.clipped))
+        lines.append("TRUST  pitch/K/coupling: %s   decay d0/d1 and wires: %s"
+                     % ("yes" if sc.trust_freq else "NO", "yes" if sc.trust_decay else "NO"))
+        lines.extend("  - " + n for n in sc.notes)
     return "\n".join(lines)

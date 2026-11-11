@@ -231,3 +231,51 @@ def test_l6_fit_recovers_snare_modal_and_wires():
     assert abs(w.wire_threshold - 0.15) < 0.05
     assert np.isclose(w.wire_brightness, 4000.0, rtol=0.25)
     assert np.isclose(w.wire_level, 0.8, rtol=0.3)
+
+
+# ---------------------------------------------------------------- reference screening
+
+def test_screen_passes_clean_hits():
+    import drums, fit
+    for d in (drums.snare("edge", wires=False), drums.snare("center", wires=True),
+              drums.tenor(370.0, 0.2), drums.bass(98.0), drums.bass(65.0)):
+        s = fit.screen(drums.render_drum(d), d.batter.sr)
+        assert s.trust_freq and s.trust_decay and s.n_hits == 1 and not s.notes, (d.name, s.notes)
+
+
+def test_screen_flags_bad_references():
+    import drums, fit
+    from scipy.signal import fftconvolve
+    sr = 48000
+    y = drums.render_drum(drums.tenor(370.0, 0.2))
+    peak = np.max(np.abs(y))
+
+    s = fit.screen(np.clip(y, -0.5 * peak, 0.5 * peak), sr)             # clipped
+    assert s.clipped and not s.trust_freq and not s.trust_decay
+
+    two = y.copy()
+    two[int(0.3 * sr):] += 0.8 * y[:len(y) - int(0.3 * sr)]               # second hit
+    s = fit.screen(two, sr)
+    assert s.n_hits == 2 and s.trust_freq and not s.trust_decay
+
+    s = fit.screen(y[:len(y) // 10], sr)                                  # tail cut off
+    assert s.tail_db > -40 and not s.trust_decay
+
+    noisy = y + peak * 10 ** (-25 / 20) * np.random.default_rng(0).standard_normal(len(y))
+    s = fit.screen(noisy, sr)                                             # noise floor
+    assert s.snr_db < 30 and not s.trust_freq and not s.trust_decay
+
+    w = int(0.01 * sr)                                                    # 4:1 compressor
+    env = np.sqrt(np.maximum(fftconvolve(y ** 2, np.ones(w) / w, mode="same"), 0)) + 1e-12
+    over = np.maximum(20 * np.log10(env / env.max()) + 30, 0)
+    s = fit.screen(y * 10 ** (-over * 0.75 / 20), sr)
+    assert s.decay_ratio > 1.6 and s.trust_freq and not s.trust_decay
+
+    # reverb longer and louder than the drum's own tail (snare: short decay)
+    ys = drums.render_drum(drums.snare("edge", wires=False))
+    n = int(1.2 * sr)
+    ir = np.random.default_rng(1).standard_normal(n) * np.exp(-6.9 * np.arange(n) / n)
+    ir *= 0.3 / np.sqrt(np.sum(ir ** 2))
+    ir[0] = 1.0
+    s = fit.screen(fftconvolve(ys, ir), sr)
+    assert s.decay_ratio < 0.6 and s.trust_freq and not s.trust_decay
