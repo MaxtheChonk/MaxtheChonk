@@ -241,6 +241,19 @@ recording and "frankenstein" it. Scratch script (not committed, audio stays out 
   but not the attack; one hit per drum, so every hit is identical; a new session must
   re-supply the audio (refs/ lives only in the container).
 
+## Modelled attacks instead of sampled ones (user: "we can't do our own modeled transients")
+Scratch test, not in the repo. Each sliced attack (unfaded part, 1.5-20 ms) decomposed into
+damped sinusoids with ESPRIT (Hankel SVD, shift invariance, least-squares amplitudes;
+unstable or very fast poles dropped), then rendered in place of the sample in the hybrid.
+Share of the attack energy rebuilt (587 / 522 / 485 / 439 / 390 Hz drums):
+  about 50 tones kept: 86 / 98 / 90 / 67 / 73 %
+  about 15-20 tones:   83 / 95 / 89 / 63 / 74 %
+  about 8 tones:       69 / 93 / 89 / 58 / 77 %
+Typical decay 30-175 1/s, most energy below 2.5 kHz. Files sent for listening:
+out/attack_sampled, attack_modeled_60_tones, _24_tones, _10_tones. No verdict yet.
+If adopted: the attack becomes extra rows in the mode table (freq, amp, decay, phase), no
+audio stored; decide which tones scale with tuning (drum modes) and which stay fixed (stick).
+
 ## Exact next step
 Tenors sound right to the user in hybrid form. Open items, roughly in order:
 1. Room amount: user asked for "some room"; knobs exist (`room_db`, `room_rt60`), values are
