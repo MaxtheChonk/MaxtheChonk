@@ -210,6 +210,22 @@ User verdict on `tenor_sweep.wav`: right notes, not a tenor. Measured against th
 - Sent to the user for listening: out/tenor_1_no_pop, 2_with_pop, 3/4 with example rooms
   (0.3 s at -18 dB, 0.8 s at -12 dB; examples only).
 
+## Hybrid test: sampled attack + modelled ring (user idea, scratch only, NOT in the repo)
+User on the pop version: "i hear like no transient"; asked to slice the transient from the
+recording and "frankenstein" it. Scratch script (not committed, audio stays out of the repo):
+- Per hit: high-pass 150 Hz, align, take the 8 rung frequencies (measured peak where found),
+  least-squares fit of amplitude AND phase of each rung on 15-300 ms, extrapolate back to the
+  onset, subtract. Residual, faded out over 20-40 ms, = the sampled transient.
+- Finding: that transient holds -2.6 .. -9.5 dB of the whole hit's energy (25-55%), far more
+  than the pop partial + noise slice gave. The 8 rungs explain 43-92% of the hit after 15 ms
+  (worst on the 589 Hz drum).
+- Files sent: A real attack + that hit's own fitted ring; B real attack + generic model ring
+  (pooled profile, phases from the fit, noise map faded in as the sample fades out);
+  C one drum's attack reused on all five; D the attacks alone.
+- If adopted: needs a per-partial start phase in the core (ModeTable has none; render starts
+  every partial at sine phase 0), a stored transient per drum, and the user's OWN recordings
+  for anything shipped (these attacks are cut from a third-party video).
+
 ## Exact next step
 The limit is now the reference recording, not the fitting code. Before more modelling, get a
 better tenor source (lossless or high-bitrate, single hits ringing out > 1 s, close and dry),
