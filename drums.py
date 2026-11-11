@@ -7,7 +7,7 @@ PLACEHOLDER until Layer 6 fits it to reference recordings; nothing is tuned by e
 Non-membrane partials (air column, rim click) are stored in the same ModeTable
 with m = -1 (column) or m = -2 (rim), so the whole drum is still one mode table.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 import numpy as np
@@ -48,6 +48,19 @@ class DrumPreset:
 def f0_for_pitch(pitch_hz: float, K: float) -> float:
     """In-vacuo f0 such that the air-loaded (0,1) mode sounds at pitch_hz."""
     return pitch_hz * np.sqrt(1 + K / jn_zeros(0, 1)[0])
+
+
+def retune(d: "DrumPreset", pitch_hz: float) -> "DrumPreset":
+    """Same drum, new tuning. The batter's air-loaded (0,1) mode moves to pitch_hz.
+    Held fixed (properties of the drum, not the tuning): K, the reso/batter f0 ratio,
+    the air column, and the ABSOLUTE air spring between the heads. `coupling` is
+    relative to the head frequencies (k = coupling * fb_01 * fr_01), so it is rescaled
+    by 1/s^2 to keep k unchanged. Decay (d0, d1) is NOT adjusted: it is only known at
+    the fitted tuning."""
+    f0 = f0_for_pitch(pitch_hz, d.batter.K)
+    s = f0 / d.batter.f0
+    reso = None if d.reso is None else replace(d.reso, f0=d.reso.f0 * s)
+    return replace(d, batter=replace(d.batter, f0=f0), reso=reso, coupling=d.coupling / s ** 2)
 
 
 def column_freqs(L_eff: float, n: int, c: float = 343.0) -> np.ndarray:

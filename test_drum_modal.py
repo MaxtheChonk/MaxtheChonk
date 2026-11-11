@@ -295,3 +295,28 @@ def test_slice_hits_finds_each_hit_in_a_long_take():
         assert s.n_hits == 1 and s.trust_freq and s.trust_decay, s.notes
         f, level = fit.extract_peaks(take[a:b], sr)
         assert np.isclose(f[0], pitch, rtol=2e-3)       # lowest peak = the tuned (0,1) mode
+
+
+# ---------------------------------------------------------------- retuning
+
+def test_retune_moves_pitch_and_keeps_the_drum():
+    import drums
+
+    def split(d):   # f_hi^2 - f_lo^2 of the (0,1) pair = 2 * absolute air spring
+        t = drums.drum_tables(d)[0]
+        pair = t.freq[(t.m == 0) & (t.n == 1)]
+        return pair.max() ** 2 - pair.min() ** 2
+
+    low = drums.bass(65.0)
+    high = drums.retune(low, 98.0)
+    assert np.isclose(drums.drum_tables(high)[0].freq[0], 98.0)
+    assert high.batter.K == low.batter.K
+    assert np.isclose(split(high), split(low), rtol=1e-9)
+    assert np.isclose(drums.drum_tables(drums.retune(high, 65.0))[0].freq[0], 65.0)   # round trip
+
+    t1 = drums.tenor(300.0, 0.25)
+    a, b = drums.drum_tables(t1)[0], drums.drum_tables(drums.retune(t1, 350.0))[0]
+    assert np.isclose(b.freq[(b.m == 0) & (b.n == 1)][0], 350.0)
+    assert np.allclose(a.freq[a.m == drums.COLUMN], b.freq[b.m == drums.COLUMN])  # shell unchanged
+    mem = a.m >= 0
+    assert np.allclose(b.freq[b.m >= 0] / a.freq[mem], 350.0 / 300.0)             # head ratios unchanged

@@ -12,12 +12,15 @@
   `fit_drum`; `report` prints a TRUST line for pitch/K/coupling and for decay/wires.
 - Hit slicer (not in SPEC): `fit.slice_hits(y, sr) -> [(start, end)]` cuts a long take into
   candidate single hits; screen each slice before fitting. Tested on a synthetic 4-hit take.
+- Retuning (not in SPEC): `drums.retune(preset, pitch_hz)` moves the pitch and holds K, the
+  reso/batter ratio, the air column and the absolute air spring (rescales `coupling` by 1/s^2).
+  Decay is not adjusted. Named tuning sets NOT built: need real pitches per style from the user.
 - `demo.py`: all SPEC deliverables render into `out/` (gitignored). Add paths to `REFERENCES`
   in demo.py to fit and print reports.
 
 ## Test results
-Last run `python -m pytest -q` -> 22 passed
-- L1 (3), L2 (1), L3 (4), L4 (2), L5 (6), L6 (3), screening (2), slicer (1)
+Last run `python -m pytest -q` -> 23 passed
+- L1 (3), L2 (1), L3 (4), L4 (2), L5 (6), L6 (3), screening (2), slicer (1), retune (1)
 - History: test_l6_fit_recovers_snare_modal_and_wires failed once (wire threshold 0.098 vs
   0.15). Fixed in the fitter, tolerance unchanged: `band_map` went from 10 bands x 8 frames to
   6 bands x 40 frames, because the threshold shows up as WHEN the wire noise cuts off.
@@ -110,5 +113,7 @@ Then:
 2. Fit one tenor first (`fit.fit_drum` with a `drums.tenor(pitch, L_eff)` template). Needs
    shell length L_eff from the user or the drum's spec sheet.
 3. Write only trusted fitted numbers into drums.py.
-Also pending (user has not said yes): tunable presets = store the air spring as an absolute
-value so coupling survives retuning, `retune(preset, pitch)`, named tuning sets.
+User is on mobile and cannot edit the environment there; expect (a) from a computer later
+or (b) an uploaded audio file. Shell depth unknown to the user: look up the TAMA Fieldstar
+spec, else fit L_eff from non-membrane peaks, else leave the column off.
+Still open: named tuning sets per corps style (need pitches from the user).
