@@ -12,6 +12,7 @@ from dataclasses import replace
 import numpy as np
 
 import drums
+import engine
 import fit
 from drum_modal import plot_spectrum, spectrum, write_wav
 
@@ -57,6 +58,22 @@ def hybrid_tenors():
         print("no %s: tenors rendered model-only" % TENOR_ATTACKS)
         return tenors
     return [drums.with_attack(d, a) for d, a in zip(tenors, drums.load_attacks(TENOR_ATTACKS))]
+
+
+def build_tenor_presets() -> None:
+    """Measure the tenor presets from the source recording and write presets/*.json:
+    per drum its pitch, K, (0,1) offset, the attack as damped tones and the rung phases.
+    Only numbers are written, no audio. Needs TENOR_SOURCE."""
+    y, sr = fit.load_mono(TENOR_SOURCE)
+    rows = []
+    for (start, length), (pitch, K, scale) in zip(TENOR_CUTS, drums.REFERENCE_TENORS):
+        a = fit.extract_attack(y[int((start - 0.05) * sr):int((start + length) * sr)], sr,
+                               drums.TENOR_RUNG_DECAY, lead_s=0.0015, fmin=150, fmax=6000, floor_db=-50)
+        tones, explained = fit.attack_tones(a, sr)
+        print("tenor %g Hz: %d attack tones rebuild %.0f%% of the sliced attack" % (pitch, len(tones), 100 * explained))
+        rows.append(dict(name="tenor_%gHz" % pitch, pitch_hz=pitch, K=K, f01_scale=scale,
+                         attack_tones=[list(t) for t in tones], rung_phase=list(a["rung_phase"])))
+    engine.save_presets(engine.TENOR_PRESETS, "TAMA Fieldstar tenor tuning tutorial audio, 84 kbps MP3", rows)
 
 
 def fitted(d: drums.DrumPreset) -> drums.DrumPreset:
@@ -107,9 +124,27 @@ def main():
             d = fitted(drums.snare(strike, wires=wires))
             save(d, "snare_%s_%s" % (strike, "wires" if wires else "nowires"))
 
-    tenors = hybrid_tenors()
+    # tenor presets on the generative engine (modelled attack, no audio needed)
+    if os.path.exists(TENOR_SOURCE) and not os.path.exists(engine.TENOR_PRESETS):
+        build_tenor_presets()
+    tenors = engine.preset_drums() or hybrid_tenors()
     sweep = [save(d, "tenor_%d" % (i + 1)) for i, d in enumerate(tenors)]
     write_wav(OUT + "/tenor_sweep.wav", np.concatenate(sweep), tenors[0].batter.sr)
+
+    # generated drums: knobs + rules only, no recording of these drums exists
+    gen = [save(engine.generate(engine.DrumSpec(name="gen_%gHz" % p, pitch_hz=p)), "generated_%gHz" % p)
+           for p in (700.0, 600.0, 500.0, 400.0, 300.0, 220.0, 160.0, 110.0)]
+    write_wav(OUT + "/generated_pitch_sweep.wav", np.concatenate(gen), 48000)
+    # strike position, rim to centre, on one preset
+    pos = [save(d, "strike_%.2f" % d.batter.r_s) for d in
+           (engine.preset_drums(strike_r=r)[1] for r in (0.9, 0.75, 0.65, 0.5, 0.35, 0.2, 0.05))] \
+        if engine.load_presets() else []
+    if pos:
+        write_wav(OUT + "/strike_position_sweep.wav", np.concatenate(pos), 48000)
+    # ring time on one generated drum
+    ring = [save(engine.generate(engine.DrumSpec(name="ring", pitch_hz=330.0, ring=r, duration=1.5)), "ring_x%g" % r)
+            for r in (0.4, 1.0, 2.5)]
+    write_wav(OUT + "/ring_time_sweep.wav", np.concatenate(ring), 48000)
 
     basses = [fitted(drums.bass(p)) for p in BASS_PITCHES_HZ]
     hits = [save(d, "bass_%d" % (i + 1)) for i, d in enumerate(basses)]

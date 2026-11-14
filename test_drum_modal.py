@@ -526,3 +526,121 @@ def test_attack_file_round_trip(tmp_path):
     back = drums.load_attacks(path)
     assert len(back) == 2 and np.array_equal(back[1]["attack"], a["attack"])
     assert float(back[0]["lead_s"]) == 0.002 and tuple(back[0]["rung_phase"]) == (0.1, -0.2)
+
+
+# ---------------------------------------------------------------- generative engine
+
+def _rules():
+    # rules with a small synthetic attack, so these tests do not depend on a preset file
+    import engine
+    return engine.Rules(attack_tones=((0.7, 1.5, 200.0, 0.3), (3.1, 0.4, 400.0, -1.0)),
+                        rung_phase=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8))
+
+
+def test_engine_at_reference_spot_is_the_measured_profile():
+    import drums, engine
+    r = _rules()
+    d = engine.generate(engine.DrumSpec(pitch_hz=522.0, K=2.2, f01_scale=0.72), r)
+    t = drums.drum_tables(d)[0]
+    ref = drums.drum_tables(drums.reference_tenors()[1])[0]
+    for m in range(len(r.rung_amp_db)):
+        mine = (t.m == m) & (t.n == 1)
+        theirs = (ref.m == m) & (ref.n == 1)
+        assert np.isclose(t.freq[mine][0], ref.freq[theirs][0])
+        assert np.isclose(t.amp[mine][0], ref.amp[theirs][0]) and t.decay[mine][0] == ref.decay[theirs][0]
+    assert np.isclose(t.freq[(t.m == 1) & (t.n == 1)][0], 522.0)
+    # circular modes sit at their measured level at the reference spot
+    c02 = (t.m == 0) & (t.n == 2)
+    assert np.isclose(20 * np.log10(abs(t.amp[c02][0])), r.circular_db)
+
+
+def test_engine_strike_position_follows_the_mode_shapes():
+    import drums, engine
+    from scipy.special import jn_zeros, jv
+    r = _rules()
+    at = lambda pos: drums.drum_tables(engine.generate(engine.DrumSpec(pitch_hz=400.0, strike_r=pos), r))[0]
+    ref, centre, edge = at(r.strike_ref), at(0.0), at(0.9)
+    ring = lambda t: (t.m >= 1) & (t.n == 1)
+    assert np.all(centre.amp[ring(centre)] == 0)                       # centre hit: no m >= 1 rung
+    assert centre.amp[(centre.m == 0) & (centre.n == 1)][0] > ref.amp[(ref.m == 0) & (ref.n == 1)][0]
+    c = lambda t: np.abs(t.amp[(t.m == 0) & (t.n >= 2)])
+    assert np.all(c(centre) > c(ref))                                  # circular modes come up
+    # every rung changes by exactly its mode-shape ratio
+    for m in range(len(r.rung_amp_db)):
+        a = jn_zeros(m, 1)[0]
+        want = jv(m, a * 0.9) / jv(m, a * r.strike_ref)
+        got = edge.amp[(edge.m == m) & (edge.n == 1)][0] / ref.amp[(ref.m == m) & (ref.n == 1)][0]
+        assert np.isclose(got, want)
+    # frequencies and decays do not depend on where you hit
+    assert np.array_equal(np.sort(edge.freq), np.sort(ref.freq))
+
+
+def test_engine_generates_a_drum_no_recording_exists_for():
+    import drums, engine
+    r = _rules()
+    spec = engine.DrumSpec(name="floor", pitch_hz=150.0, ring=2.0, duration=0.5)
+    d = engine.generate(spec, r)
+    t = drums.drum_tables(d)[0]
+    assert np.isclose(t.freq[(t.m == 1) & (t.n == 1)][0], 150.0)
+    assert np.allclose(t.decay[(t.m >= 1) & (t.n == 1)], np.array(r.rung_decay)[1:] / 2.0)   # ring knob
+    att = t.m == drums.ATTACK
+    assert att.sum() == 2 and np.allclose(np.sort(t.freq[att]), [0.7 * 150.0, 3.1 * 150.0])   # tracks pitch
+    fixed = drums.drum_tables(engine.generate(replace_spec(spec, attack_tracking=0.0), r))[0]
+    assert np.allclose(np.sort(fixed.freq[fixed.m == drums.ATTACK]), [0.7 * r.noise_ref_hz, 3.1 * r.noise_ref_hz])
+    y = drums.render_drum(d)
+    assert len(y) == int(0.5 * 48000) and np.all(np.isfinite(y)) and np.max(np.abs(y)) > 0
+    quiet = engine.generate(replace_spec(spec, attack=0.0, noise=0.0), r)
+    assert not np.any(drums.drum_tables(quiet)[0].m == drums.ATTACK) and quiet.noise_bands == ()
+
+
+def replace_spec(spec, **kw):
+    from dataclasses import replace
+    return replace(spec, **kw)
+
+
+def test_pitch_from_tension_scales_like_a_membrane():
+    import engine
+    f = engine.pitch_from_tension(0.30, 4000.0, 0.35)
+    assert np.isclose(engine.pitch_from_tension(0.60, 4000.0, 0.35), f / 2)      # twice the diameter
+    assert np.isclose(engine.pitch_from_tension(0.30, 16000.0, 0.35), f * 2)     # four times the tension
+    assert np.isclose(engine.pitch_from_tension(0.30, 4000.0, 1.40), f / 2)      # four times the mass
+    assert np.isclose(f, 2.404825557695773 / (np.pi * 0.30) * np.sqrt(4000.0 / 0.35))
+    assert engine.pitch_from_tension(0.30, 4000.0, 0.35, K=2.0) < f              # air loading lowers it
+
+
+def test_attack_tones_recovers_known_tones():
+    import fit
+    sr, lead = 48000, 0.0015
+    t = np.arange(int(0.04 * sr)) / sr - lead
+    truth = [(300.0, 1.0, 150.0, 0.4), (1250.0, 0.6, 400.0, -1.1), (4100.0, 0.3, 700.0, 2.0)]
+    x = sum(a * np.exp(-d * t) * np.sin(2 * np.pi * f * t + ph) for f, a, d, ph in truth) * (t >= 0)
+    rows, explained = fit.attack_tones(dict(attack=x, lead_s=lead, f11=500.0), sr, n_tones=3)
+    assert explained > 0.999 and len(rows) == 3
+    for (ratio, a, d, ph), (f0, a0, d0, ph0) in zip(rows, truth):
+        assert np.isclose(ratio * 500.0, f0, rtol=1e-3) and np.isclose(a, a0, rtol=0.02)
+        assert np.isclose(d, d0, rtol=0.02) and abs(np.angle(np.exp(1j * (ph - ph0)))) < 0.02
+
+
+def test_modelled_attack_is_rows_of_the_mode_table():
+    import drums, engine
+    from drum_modal import render
+    r = _rules()
+    d = engine.generate(engine.DrumSpec(pitch_hz=480.0, noise=0.0), r)
+    t = drums.drum_tables(d)[0]
+    att = t.m == drums.ATTACK
+    assert np.allclose(t.amp[att][np.argsort(t.freq[att])], [1.5, 0.4]) and d.attack is None
+    assert np.array_equal(drums.render_drum(d), render(t, d.batter))    # the table is the whole hit
+    assert np.allclose(t.phase[(t.m >= 1) & (t.n == 1)], r.rung_phase[1:])
+
+
+def test_preset_file_round_trip(tmp_path):
+    import drums, engine
+    path = str(tmp_path / "p.json")
+    rows = [dict(name="a", pitch_hz=500.0, K=2.0, f01_scale=0.8, attack_tones=[[0.7, 1.0, 100.0, 0.0]], rung_phase=[0.0] * 8),
+            dict(name="b", pitch_hz=400.0, K=3.0, f01_scale=0.7, attack_tones=[[0.9, 2.0, 300.0, 1.0]], rung_phase=[0.5] * 8)]
+    engine.save_presets(path, "test", rows)
+    ds = engine.preset_drums(path, strike_r=0.5)
+    assert [d.name for d in ds] == ["a", "b"] and ds[1].batter.K == 3.0 and ds[1].batter.r_s == 0.5
+    assert ds[0].attack_tones == ((0.7, 1.0, 100.0, 0.0),) and ds[1].attack_tones == ((0.9, 2.0, 300.0, 1.0),)
+    assert engine.tenor_rules(path).attack_tones == ((0.9, 2.0, 300.0, 1.0),)   # generic = drum index 1
+    assert engine.preset_drums(str(tmp_path / "missing.json")) == []

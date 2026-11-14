@@ -421,6 +421,41 @@ def extract_attack(y, sr, rung_decay, n_rungs=8, lead_s=0.002, fit_from_s=0.015,
                 attack_db=float(10 * np.log10(np.sum(attack ** 2) / np.sum(x ** 2))))
 
 
+def attack_tones(a: dict, sr, n_tones=60, until_s=0.020, max_decay=3000.0, min_decay=np.log(10) / 0.040):
+    """Model a sliced attack (extract_attack result) as short damped tones, so that no audio
+    has to be stored. ESPRIT on the part of the attack from the ring start (lead_s) to
+    until_s (before its fade-out begins): Hankel matrix -> signal subspace -> poles, then
+    linear least squares for amplitude and phase. Unstable, non-oscillating and very fast
+    poles are dropped. With n_tones = 60 about 35-50 survive; listening test by the user:
+    60 is indistinguishable from the sample, 24 sounds "compressed".
+    Returns (rows, explained): rows of (freq / f11, amplitude re the (1,1) rung, decay 1/s,
+    start phase rad) for a*exp(-d*t)*sin(2*pi*f*t + phase), t from the ring start;
+    explained = share of the analysed attack energy the tones rebuild."""
+    i0, i1 = int(round(a["lead_s"] * sr)), int(until_s * sr)
+    x = np.asarray(a["attack"], dtype=float)[i0:i1]
+    L = len(x) // 2
+    H = np.lib.stride_tricks.sliding_window_view(x, L).T
+    U = np.linalg.svd(H, full_matrices=False)[0][:, :2 * n_tones]
+    z = np.linalg.eigvals(np.linalg.lstsq(U[:-1], U[1:], rcond=None)[0])
+    freq, decay = np.angle(z) * sr / (2 * np.pi), -np.log(np.abs(z)) * sr
+    ok = (freq > 20.0) & (freq < 0.45 * sr) & (decay > 0) & (decay < max_decay)
+    # An attack tone must be over when the attack is: at least 20 dB down 40 ms in (the
+    # sampled attack is faded out by then). 18 ms of data cannot tell a slow decay from a
+    # very slow one, and a tone fitted with almost none would ring on for seconds.
+    freq, decay = freq[ok], np.maximum(decay[ok], min_decay)
+    t = np.arange(len(x)) / sr
+    env = np.exp(-decay[None, :] * t[:, None])
+    B = np.hstack([env * np.sin(2 * np.pi * freq[None, :] * t[:, None]),
+                   env * np.cos(2 * np.pi * freq[None, :] * t[:, None])])
+    c = np.linalg.lstsq(B, x, rcond=None)[0]
+    k = len(freq)
+    amp, phase = np.hypot(c[:k], c[k:]), np.arctan2(c[k:], c[:k])
+    explained = float(1 - np.sum((B @ c - x) ** 2) / np.sum(x ** 2))
+    order = np.argsort(freq)
+    rows = tuple((float(freq[i] / a["f11"]), float(amp[i]), float(decay[i]), float(phase[i])) for i in order)
+    return rows, explained
+
+
 def align_to_attack(y, sr, lead_s=0.001):
     """Trim so the hit starts lead_s before the first sample above 20% of the peak."""
     on = int(np.argmax(np.abs(y) > 0.2 * np.max(np.abs(y))))

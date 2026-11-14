@@ -12,11 +12,11 @@ from typing import Optional
 
 import numpy as np
 from scipy.signal import butter, fftconvolve, lfilter, sosfilt
-from scipy.special import jn_zeros
+from scipy.special import jn_zeros, jv
 
 from drum_modal import DrumParams, ModeTable, mode_table, render, two_head_tables
 
-COLUMN, RIM, POP = -1, -2, -3   # values of ModeTable.m marking non-membrane partials
+COLUMN, RIM, POP, ATTACK = -1, -2, -3, -4   # values of ModeTable.m marking non-membrane partials
 
 
 @dataclass
@@ -49,6 +49,21 @@ class DrumPreset:
     rung_amp_db: tuple = ()            # initial amplitude of (m,1), dB re the strongest
     rung_decay: tuple = ()             # 1/s per rung
     rung_phase: tuple = ()             # rad, start phase per rung; empty = 0
+    # strike position on top of the measured profile. The profile was measured at ONE strike
+    # spot (strike_ref); moving batter.r_s away from it scales each rung by the membrane
+    # mode shape, J_m(alpha*r_s) / J_m(alpha*strike_ref). At r_s = strike_ref nothing changes.
+    strike_ref: float = 0.0            # 0..1 of the radius; 0 = strike position has no effect
+    # circular modes (0,n), n >= 2: silent in the profile (weak at the playing zone) but they
+    # are what a centre hit excites. Level of (0,2) at strike_ref re the strongest rung; the
+    # others and the position dependence follow the mode-shape formula. Needs strike_ref > 0.
+    circular_db: float = float("-inf")  # -inf = off
+    circular_n: int = 3                 # how many: (0,2) .. (0,1+circular_n)
+    # modelled attack: short damped tones measured from a real attack (fit.attack_tones).
+    # Rows of (freq as a multiple of the pitch-mode frequency, amplitude re the strongest
+    # rung of the profile, decay 1/s, start phase rad). They are ordinary rows of the mode
+    # table (ModeTable.m == ATTACK), so no audio is stored.
+    attack_tones: tuple = ()
+    attack_gain: float = 1.0           # scales all attack tones
     # sampled attack (hybrid): the first milliseconds of a real hit with its ringing rungs
     # subtracted (fit.extract_attack). The model's ring starts attack_lead_s into the
     # sample, in phase with the recording it was cut from (rung_phase), so there is no seam.
@@ -104,18 +119,22 @@ def column_freqs(L_eff: float, n: int, c: float = 343.0) -> np.ndarray:
     return np.arange(1, n + 1) * c / (2 * L_eff)
 
 
-def add_partials(t: ModeTable, kind: int, freq, amp, decay) -> ModeTable:
-    """Append non-membrane partials (m = kind, n = 1..) and re-sort by freq."""
+def add_partials(t: ModeTable, kind: int, freq, amp, decay, phase=None, n=None) -> ModeTable:
+    """Append partials (m = kind, n = 1.. unless given) and re-sort by freq."""
     freq = np.atleast_1d(np.asarray(freq, dtype=float))
     k = len(freq)
+    old_phase = t.phase
+    if phase is not None and old_phase is None:
+        old_phase = np.zeros(len(t.freq))
+    ph = None if old_phase is None else np.concatenate(
+        [old_phase, np.zeros(k) if phase is None else np.broadcast_to(phase, k)])
     m = np.concatenate([t.m, np.full(k, kind)])
-    n = np.concatenate([t.n, np.arange(1, k + 1)])
+    nn = np.concatenate([t.n, np.arange(1, k + 1) if n is None else np.asarray(n)])
     f = np.concatenate([t.freq, freq])
     a = np.concatenate([t.amp, np.broadcast_to(amp, k)])
     d = np.concatenate([t.decay, np.broadcast_to(decay, k)])
-    ph = None if t.phase is None else np.concatenate([t.phase, np.zeros(k)])
-    o = np.argsort(f)
-    return ModeTable(m[o], n[o], f[o], a[o], d[o], None if ph is None else ph[o])
+    o = np.argsort(f, kind="stable")
+    return ModeTable(m[o], nn[o], f[o], a[o], d[o], None if ph is None else ph[o])
 
 
 def m_gt0_fraction(t: ModeTable) -> float:
@@ -125,21 +144,47 @@ def m_gt0_fraction(t: ModeTable) -> float:
 
 # ------------------------------------------------------------------ tables + render
 
+def _safe(x, floor=0.05):
+    """Keep a mode-shape denominator away from zero (strike_ref on a nodal circle)."""
+    return np.where(np.abs(x) < floor, np.where(x < 0, -floor, floor), x)
+
+
+def profile_table(d: DrumPreset, formula: ModeTable) -> ModeTable:
+    """Ring of a measured-profile drum: the (m,1) rungs with table amplitude and decay,
+    frequencies from the physics, scaled for strike position, plus the circular modes."""
+    k = len(d.rung_amp_db)
+    r_s, r_ref = d.batter.r_s, d.strike_ref
+    m = np.arange(k)
+    freq = np.array([formula.freq[(formula.m == i) & (formula.n == 1)][0] for i in m])
+    amp = 10 ** (np.asarray(d.rung_amp_db) / 20)
+    if r_ref > 0:
+        alpha = np.array([jn_zeros(i, 1)[0] for i in m])
+        amp = amp * jv(m, alpha * r_s) / _safe(jv(m, alpha * r_ref))
+    out = ModeTable(m, np.ones(k, int), freq, amp, np.asarray(d.rung_decay, dtype=float),
+                    np.asarray(d.rung_phase, dtype=float) if len(d.rung_phase) else None)
+    if r_ref > 0 and np.isfinite(d.circular_db):
+        nn = np.arange(2, 2 + d.circular_n)
+        alpha = jn_zeros(0, nn[-1])[1:]                       # alpha_02 ..
+        shape = lambda r: jv(0, alpha * r) / jv(1, alpha) ** 2
+        level = 10 ** (d.circular_db / 20) * shape(r_s) / _safe(shape(r_ref)[0])
+        f = np.array([formula.freq[(formula.m == 0) & (formula.n == i)][0] for i in nn])
+        out = add_partials(out, 0, f, level, d.rung_decay[0], n=nn)
+    return out
+
+
 def drum_tables(d: DrumPreset):
     """Returns (out_table, reso_table). reso_table is None for single-head drums."""
     if d.reso is None:
         out, reso = mode_table(d.batter), None
         pitch_hz = out.freq[(out.m == d.pitch_mode[0]) & (out.n == d.pitch_mode[1])][0]
+        unit = np.max(np.abs(out.amp))            # amplitude of the strongest partial
         if d.rung_amp_db:
-            k = len(d.rung_amp_db)
-            rung = (out.n == 1) & (out.m < k)
-            m = out.m[rung]
-            out = ModeTable(m, out.n[rung], out.freq[rung],
-                            10 ** (np.asarray(d.rung_amp_db)[m] / 20), np.asarray(d.rung_decay)[m],
-                            np.asarray(d.rung_phase)[m] if len(d.rung_phase) else None)
+            out = profile_table(d, out)
+            unit = 1.0                            # profile amplitudes are re the strongest rung
     else:
         out, reso = two_head_tables(d.batter, d.reso, d.coupling)
         pitch_hz = out.freq[0]
+        unit = np.max(np.abs(out.amp))
     ref = np.max(np.abs(out.amp))
     if d.pop_amp != 0:
         out = add_partials(out, POP, d.pop_ratio * pitch_hz, d.pop_amp * ref, d.pop_decay)
@@ -148,6 +193,10 @@ def drum_tables(d: DrumPreset):
                            d.column_level * ref, d.column_decay)
     if d.rim_level != 0:
         out = add_partials(out, RIM, d.rim_hz, d.rim_level * ref, d.rim_decay)
+    if len(d.attack_tones) and d.attack_gain != 0:
+        tones = np.asarray(d.attack_tones, dtype=float)
+        out = add_partials(out, ATTACK, tones[:, 0] * pitch_hz, tones[:, 1] * unit * d.attack_gain,
+                           tones[:, 2], phase=tones[:, 3])
     return out, reso
 
 
@@ -215,7 +264,7 @@ def noise_signal(d: DrumPreset, table: ModeTable, n_iter: int = 15) -> np.ndarra
     t = np.arange(n) / p.sr
     edges = np.asarray(d.noise_edges, dtype=float)
     mid, dur = 0.5 * (edges[:-1] + edges[1:]), np.diff(edges)
-    keep = table.m != POP                                        # the map is re the ringing part
+    keep = (table.m != POP) & (table.m != ATTACK)                # the map is re the ringing part
     body = ModeTable(table.m[keep], table.n[keep], table.freq[keep], table.amp[keep], table.decay[keep])
     target = modal_energy(body, edges[-1]) * 10 ** (np.asarray(d.noise_db) / 10)
     rng = np.random.default_rng(d.noise_seed)
@@ -245,23 +294,31 @@ def add_room(y, sr, rt60, level_db, seed=0):
     return y + wet * np.sqrt(np.sum(y ** 2) * 10 ** (level_db / 10) / np.sum(wet ** 2))
 
 
+def _attack_window(t, fade):
+    """1 while the attack plays, 0 after it: raised-cosine fall between fade[0] and fade[1]."""
+    return 0.5 - 0.5 * np.cos(np.pi * np.clip((fade[1] - t) / (fade[1] - fade[0]), 0, 1))
+
+
 def render_drum(d: DrumPreset) -> np.ndarray:
     out, reso = drum_tables(d)
     p = d.batter
     y = render(out, p)
+    n = len(y)
     if d.attack is not None:
-        # hybrid: delay the model by the lead, fade the noise in as the sample fades out
-        n, lead = len(y), int(round(d.attack_lead_s * p.sr))
-        t = np.arange(n) / p.sr + d.attack_lead_s
-        f0, f1 = d.attack_fade
-        keep = 0.5 - 0.5 * np.cos(np.pi * np.clip((f1 - t) / (f1 - f0), 0, 1))   # 1 -> 0
+        # sampled attack: delay the model by the lead, fade the noise in as the sample fades out
+        lead = int(round(d.attack_lead_s * p.sr))
         if d.noise_bands:
-            y = y + noise_signal(d, out) * (1 - keep)
+            y = y + noise_signal(d, out) * (1 - _attack_window(np.arange(n) / p.sr + d.attack_lead_s, d.attack_fade))
         y = np.concatenate([np.zeros(lead), y])[:n]
         a = d.attack[:n] * np.max(np.abs(out.amp[out.m >= 0]))
         y[:len(a)] += a
     elif d.noise_bands:
-        y = y + noise_signal(d, out)
+        nz = noise_signal(d, out)
+        if len(d.attack_tones):
+            # modelled attack: its tones already carry the first milliseconds, and the noise
+            # map was measured with them included, so the noise fades in the same way
+            nz = nz * (1 - _attack_window(np.arange(n) / p.sr, d.attack_fade))
+        y = y + nz
     if np.isfinite(d.room_db):
         y = add_room(y, p.sr, d.room_rt60, d.room_db, d.room_seed)
     if d.wires and reso is not None:

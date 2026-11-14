@@ -48,14 +48,31 @@
   Attack audio is NOT in the repo: `refs/` is git-ignored. `demo.hybrid_tenors()` extracts
   from `refs/tenor_tutorial.wav` (mono 48 kHz, TENOR_CUTS in demo.py) into
   `refs/tenor_attacks.npz`; without those files tenors render model-only.
+- GENERATIVE ENGINE (user direction: "marching drums as close as possible = presets, the
+  full synth generative on parameters"; modal kept, waveguide mesh deferred). `engine.py`:
+  `DrumSpec` (knobs: pitch, K, (0,1) offset, strike_r, ring, attack, noise, tracking, column,
+  room), `Rules` (defaults measured from the tenor reference; each field says measured or
+  ASSUMED), `generate(spec) -> DrumPreset`, `pitch_from_tension(diameter, tension, density)`,
+  `preset_drums()` / `tenor_rules()` / `save_presets` / `load_presets`.
+  `presets/reference_tenors.json` (committed, numbers only): per drum pitch, K, f01_scale,
+  attack tones, rung phases. Built by `demo.build_tenor_presets()` from the source audio.
+  In drums.py: strike position on top of the measured profile (`strike_ref`, mode-shape ratio
+  J_m(a*r_s)/J_m(a*strike_ref)), circular modes (0,n>=2) (`circular_db`, `circular_n`),
+  modelled attack as table rows (`attack_tones`, ModeTable.m == ATTACK == -4, `attack_gain`).
+  `fit.attack_tones`: ESPRIT decomposition of a sliced attack into damped tones (60 requested,
+  36-50 kept; user: 60 sounds like the sample, 24 "compressed"). Attack-tone decay is floored
+  so each tone is >= 20 dB down at 40 ms (else slow-fitted tones rang on for seconds).
+  Engine tenor presets vs the approved sampled hybrid, band x time energy: median 0.2-0.8 dB,
+  worst -9 dB (587 Hz drum, 1.2-2.4 kHz, 5-20 ms). Tones rebuild 70-98% of each attack.
+  The sampled-attack path (`with_attack`, refs/) still exists as an option.
 - `demo.py`: all SPEC deliverables render into `out/` (gitignored). Add paths to `REFERENCES`
   in demo.py to fit and print reports.
 
 ## Test results
-Last run `python -m pytest -q` -> 35 passed
+Last run `python -m pytest -q` -> 42 passed
 - L1 (3), L2 (1), L3 (4), L4 (2), L5 (6), L6 (3), screening (2), slicer (1), retune (1),
   tenor pitch mode / (0,1) offset / ladder (3), rung profile (1), noise map (1), profile
-  round trip (1), pop (2), room (1), start phase (1), hybrid attack (2).
+  round trip (1), pop (2), room (1), start phase (1), hybrid attack (2), engine (7).
 - History of the last two: both failed twice, then were fixed in the code:
   noise map -> `noise_signal` now calibrates its envelope nodes by analysis-by-synthesis
   against `band_time_energy` (the same analysis used on recordings) and synthesises each band
@@ -255,14 +272,20 @@ If adopted: the attack becomes extra rows in the mode table (freq, amp, decay, p
 audio stored; decide which tones scale with tuning (drum modes) and which stay fixed (stick).
 
 ## Exact next step
-Tenors sound right to the user in hybrid form. Open items, roughly in order:
-1. Room amount: user asked for "some room"; knobs exist (`room_db`, `room_rt60`), values are
-   the user's call (two example settings were sent, no verdict yet).
-2. Ring quality on the high drum (rungs explain only 41%): more measured partials, per-drum
-   profiles. Needs a better source.
-3. Variation between hits (several attacks per drum, round-robin) and velocity.
-4. Bass drums, then snare (snares-off hit needed). Expect to reuse the hybrid approach.
-5. Port prep: golden-file export (mode table incl. phase, attack sample, noise nodes),
-   causal wire model, named tuning sets.
-To resume with audio: put the tenor tutorial audio at refs/tenor_tutorial.wav (mono 48 kHz),
-run `python demo.py`.
+The engine exists and the tenor presets run on it. Waiting for the user's ears on:
+out/tenor_sweep.wav (presets, modelled attack), generated_pitch_sweep.wav (700 -> 110 Hz from
+rules alone), strike_position_sweep.wav (rim -> centre), ring_time_sweep.wav.
+Known weak points of the engine, in order of importance:
+1. Rules come from ONE tenor set (390-590 Hz). Generated drums far from that are
+   extrapolation: decays, noise bands and attack are not known to scale as assumed.
+2. ASSUMED, not measured: `strike_ref = 0.65`; `attack_tracking = 1`; circular-mode decay
+   (= the (0,1) rung decay); attack does not change with strike position.
+3. Single-head only. Two-head drums (snare, bass) still use the Layer 4/5 formula path with
+   placeholder numbers; they need their own reference and rules.
+4. Size is not a sound knob: at a fixed pitch nothing in the rules depends on diameter.
+   `pitch_from_tension` only converts diameter + tension + density into a pitch.
+Next candidates: bass reference -> two-head rules; velocity (hit strength) and hit-to-hit
+variation; room amount (user's call, knobs exist); export for the C++ port (the whole hit is
+now one mode table plus a noise map); better tenor source to firm up the rules.
+To rebuild the preset file: audio at refs/tenor_tutorial.wav (mono 48 kHz), delete
+presets/reference_tenors.json, run `python demo.py`.
